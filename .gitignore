@@ -1,0 +1,6 @@
+# Ignore the virtual environment folder
+.venv/
+
+# Ignore the geodatabase folder
+RBI50K_ADMINISTRASI_KABKOTA_20230907.gdb/
+
