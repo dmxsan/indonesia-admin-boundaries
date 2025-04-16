@@ -1,3 +1,4 @@
 01-raw-data/shapefile/** filter=lfs diff=lfs merge=lfs -text
 01-raw-data/geojson/** filter=lfs diff=lfs merge=lfs -text
 02-processed-data/merged-geojson/** filter=lfs diff=lfs merge=lfs -text
+git
