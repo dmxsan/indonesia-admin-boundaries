@@ -31,8 +31,8 @@ def split_by_province(input_geojson, output_directory):
     # ---------------------------
     # Ensure that the 'WADMPR' column exists
     # ---------------------------
-    if "WADMKK" not in gdf.columns:
-        print("Error: 'WADMKK' column not found in the input file.")
+    if "WADMPR" not in gdf.columns:
+        print("Error: 'WADMPR' column not found in the input file.")
         return
 
     # ---------------------------
@@ -43,7 +43,7 @@ def split_by_province(input_geojson, output_directory):
     # ---------------------------
     # Get the unique province names from the WADMPR column
     # ---------------------------
-    provinces = gdf["WADMKK"].unique()
+    provinces = gdf["WADMPR"].unique()
 
     # ---------------------------
     # Loop through each province and export it as a separate GeoJSON
@@ -51,7 +51,7 @@ def split_by_province(input_geojson, output_directory):
     for province in provinces:
         try:
             # Filter rows belonging to this province
-            subset = gdf[gdf["WADMKK"] == province]
+            subset = gdf[gdf["WADMPR"] == province]
 
             # Create a filename-friendly version of the province name (remove spaces, slashes, etc.)
             province_clean = str(province).replace(" ", "_").replace("/", "_").replace("\\", "_")
@@ -68,5 +68,5 @@ def split_by_province(input_geojson, output_directory):
 if __name__ == "__main__":
     # Use raw strings for Windows paths
     input_geojson = r"02-processed-data/merged-geojson/District_Administration_20230907.geojson"
-    output_folder = r"02-processed-data/geojson/03-disctricts"
+    output_folder = r"02-processed-data/geojson/02-provinces/with-districts"
     split_by_province(input_geojson, output_folder)

@@ -18,9 +18,9 @@ gdf.to_file(geojson_path, driver='GeoJSON')
 # ---------------------------
 # Create simplified GeoDataFrame
 # Keep only the necessary columns plus the geometry column:
-# OBJECTID, NAMOBJ, FCODE, SRS_ID, WADMKK, WADMPR
+# OBJECTID, WADMKK, WADMPR
 # ---------------------------
-desired_columns = ['OBJECTID', 'NAMOBJ', 'FCODE', 'SRS_ID', 'WADMKK', 'WADMPR']
+desired_columns = ['OBJECTID', 'WADMKK', 'WADMPR']
 # Ensure to include the 'geometry' column in the resulting GeoDataFrame
 gdf_simplified = gpd.GeoDataFrame(
     gdf[desired_columns + ['geometry']].copy(),
