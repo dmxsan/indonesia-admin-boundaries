@@ -5,13 +5,13 @@
 RBI50K_ADMINISTRASI_KABKOTA_20230907.gdb/
 
 # Ignore shapefile folder
-01-raw-data/shapefile/
+raw-data/shapefile/
 
 # Ignore original/uncompressed raw geojson
-01-raw-data/geojson/*
+raw-data/geojson/*
 
 # Ignore simplified geojson
-02-processed-data/merged-geojson/*.geojson
+processed-data/merged-geojson/*.geojson
 
 # Ignore bfgs files
 bfg-1.15.0.jar
