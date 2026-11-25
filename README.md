@@ -46,6 +46,8 @@ scripts/
 
 Fetch any file in `processed-data/` directly via `raw.githubusercontent.com` without cloning the repository:
 
+> **Tip (Pinning a specific release):** Replace `/main/` with `/v2026.06/` in any `raw.githubusercontent.com` URL below to lock your application to the immutable June 2026 edition.
+
 ### Python (`geopandas`)
 
 ```python
