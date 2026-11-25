@@ -1,0 +1,46 @@
+# License
+
+This repository uses a dual-license structure separating original scripts from third-party geospatial boundary data.
+
+---
+
+## 1. Code (`scripts/`) — MIT License
+
+Copyright (c) 2025-2026 Dimas Maulana Ichsan
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+## 2. Geospatial Data (`processed-data/`) — Badan Informasi Geospasial (BIG) Terms Notice
+
+All administrative boundary datasets in `processed-data/` are **NOT** licensed under the MIT License above.
+
+These datasets are derived from official geospatial data published by **Badan Informasi Geospasial (BIG)** of the Republic of Indonesia via:
+- Ina-Geoportal: https://tanahair.indonesia.go.id/
+- Geoportal BIG: https://geoportal.big.go.id/
+
+All intellectual property rights and copyright over the underlying geospatial data remain **© Badan Informasi Geospasial (BIG)**. The processed datasets in this repository are provided free of charge solely for non-commercial, educational, research, and software development convenience, subject to BIG's Terms of Use and applicable Indonesian laws and regulations:
+
+1. **Mandatory Attribution:** You must clearly credit **Badan Informasi Geospasial (BIG)** as the data source in any application, publication, map, or derivative work using these boundaries.
+2. **No Commercial Resale of Raw Data:** Commercial resale or paid redistribution of the raw or unmodified geospatial dataset is prohibited without prior authorization from Badan Informasi Geospasial (BIG).
+3. **Legal Status Disclaimer:**
+   > *"Data batas yang berstatus indikatif tidak dapat dijadikan referensi hukum."*
+   
+   (Indicative boundary data cannot be used as a legal reference. Official legal administrative boundaries are governed by applicable Indonesian legislation and Ministry of Home Affairs regulations.)
