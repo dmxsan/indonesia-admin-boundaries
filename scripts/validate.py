@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate generated GeoJSON boundaries and provenance metadata."""
+"""Validate generated GeoJSON boundaries, topological coverage, and provenance metadata."""
 
 from __future__ import annotations
 
@@ -9,20 +9,22 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import shapely
 from shapely.geometry import shape
 from shapely.validation import explain_validity
 
 FORBIDDEN_FILENAMES = {"none.geojson", "null.geojson", "nan.geojson"}
-NATIONAL_FILES = {
-    "country": "indonesia_country_simplified.geojson",
-    "provinces": "indonesia_provinces_simplified.geojson",
-    "districts": "indonesia_districts_simplified.geojson",
+SIMPLIFIED_FILES = {
+    "country": ("simplified/01-national", "indonesia.geojson"),
+    "provinces": ("simplified/02-provinces", "indonesia_provinces.geojson"),
+    "districts": ("simplified/03-districts", "indonesia_districts.geojson"),
 }
+LEGACY_TOP_DIRS = ("01-national", "02-provinces", "03-districts")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Validate processed GeoJSON boundary outputs and provenance metadata."
+        description="Validate processed GeoJSON boundary outputs, coverage topology, and provenance metadata."
     )
     parser.add_argument("--data-dir", type=Path, default=Path("processed-data"), help="Processed GeoJSON root.")
     parser.add_argument(
@@ -87,12 +89,38 @@ def _non_empty_str(val: Any) -> bool:
     return isinstance(val, str) and bool(val.strip())
 
 
+def count_interior_holes(geom: Any) -> int:
+    if geom is None or geom.is_empty:
+        return 0
+    if geom.geom_type == "Polygon":
+        return len(geom.interiors)
+    if geom.geom_type == "MultiPolygon":
+        return sum(len(poly.interiors) for poly in geom.geoms)
+    return 0
+
+
+def check_coverage(geoms: list[Any], labels: list[str], context: str, errors: list[str]) -> None:
+    if len(geoms) < 2:
+        return
+    if not shapely.coverage_is_valid(geoms):
+        inv_edges = shapely.coverage_invalid_edges(geoms)
+        bad_labels = [
+            labels[i]
+            for i, edge in enumerate(inv_edges)
+            if edge is not None and not edge.is_empty
+        ]
+        errors.append(
+            f"{context}: invalid topological coverage ({len(bad_labels)} offending feature(s), "
+            f"sample: {bad_labels[:10]})."
+        )
+
+
 def validate_geojson_file(
     path: Path,
     rel_label: str,
     max_bytes: int,
     errors: list[str],
-) -> tuple[list[dict[str, Any]], int]:
+) -> tuple[list[dict[str, Any]], list[Any], int]:
     size = path.stat().st_size
     if size > max_bytes:
         errors.append(f"{rel_label}: size {size / 1_000_000:.2f} MB exceeds {max_bytes / 1_000_000:.2f} MB limit.")
@@ -102,19 +130,20 @@ def validate_geojson_file(
             data = json.load(f)
     except Exception as exc:
         errors.append(f"{rel_label}: invalid JSON ({exc}).")
-        return [], size
+        return [], [], size
 
     if not isinstance(data, dict) or data.get("type") != "FeatureCollection":
         errors.append(f"{rel_label}: top-level object must be a GeoJSON FeatureCollection.")
-        return [], size
+        return [], [], size
     if "crs" in data:
         errors.append(f"{rel_label}: legacy top-level 'crs' key is forbidden under RFC 7946.")
 
     features = data.get("features")
     if not isinstance(features, list) or not features:
         errors.append(f"{rel_label}: 'features' must be a non-empty list.")
-        return [], size
+        return [], [], size
 
+    valid_geoms: list[Any] = []
     for idx, feat in enumerate(features):
         feat_label = f"{rel_label} feature #{idx}"
         if not isinstance(feat, dict):
@@ -142,8 +171,10 @@ def validate_geojson_file(
             errors.append(f"{feat_label}: geometry is empty.")
         elif not geom.is_valid:
             errors.append(f"{feat_label}: invalid geometry ({explain_validity(geom)}).")
+        else:
+            valid_geoms.append(geom)
 
-    return features, size
+    return features, valid_geoms, size
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -152,12 +183,21 @@ def main(argv: list[str] | None = None) -> int:
     max_bytes = int(args.max_file_mb * 1_000_000)
     errors: list[str] = []
 
-    nat_dir = data_dir / "01-national"
-    prov_only_dir = data_dir / "02-provinces" / "province-only"
-    with_dist_dir = data_dir / "02-provinces" / "with-districts"
-    dist_dir = data_dir / "03-districts"
+    simp_nat_dir = data_dir / "simplified" / "01-national"
+    simp_prov_dir = data_dir / "simplified" / "02-provinces"
+    simp_dist_dir = data_dir / "simplified" / "03-districts"
+    prov_only_dir = data_dir / "high-detail" / "02-provinces" / "province-only"
+    with_dist_dir = data_dir / "high-detail" / "02-provinces" / "with-districts"
+    dist_dir = data_dir / "high-detail" / "03-districts"
 
-    for d in (nat_dir, prov_only_dir, with_dist_dir, dist_dir):
+    for legacy_name in LEGACY_TOP_DIRS:
+        legacy_dir = data_dir / legacy_name
+        if legacy_dir.exists():
+            errors.append(
+                f"Legacy top-level directory {legacy_dir} still exists; migrate to simplified/ and high-detail/."
+            )
+
+    for d in (simp_nat_dir, simp_prov_dir, simp_dist_dir, prov_only_dir, with_dist_dir, dist_dir):
         if not d.is_dir():
             errors.append(f"Missing required directory: {d}")
 
@@ -173,31 +213,46 @@ def main(argv: list[str] | None = None) -> int:
 
     max_seen_bytes = 0
     files_checked = 0
+    country_holes = 0
 
-    # 1. National outputs
+    # 1. Simplified nationwide outputs (0.001 deg)
     nat_counts: dict[str, int] = {}
-    for key, filename in NATIONAL_FILES.items():
-        path = nat_dir / filename
+    for key, (rel_dir, filename) in SIMPLIFIED_FILES.items():
+        rel_path = f"{rel_dir}/{filename}"
+        path = data_dir / rel_dir / filename
         if not path.is_file():
-            errors.append(f"Missing national file: {path}")
+            errors.append(f"Missing simplified file: {path}")
             continue
-        features, size = validate_geojson_file(path, f"01-national/{filename}", max_bytes, errors)
+        features, geoms, size = validate_geojson_file(path, rel_path, max_bytes, errors)
         max_seen_bytes = max(max_seen_bytes, size)
         files_checked += 1
         nat_counts[key] = len(features)
-        if key == "country" and len(features) != 1:
-            errors.append(f"01-national/{filename}: expected 1 feature, found {len(features)}.")
+        if key == "country":
+            if len(features) != 1:
+                errors.append(f"{rel_path}: expected 1 feature, found {len(features)}.")
+            elif len(geoms) == 1:
+                country_holes = count_interior_holes(geoms[0])
         elif key == "provinces":
+            labels = []
             for i, feat in enumerate(features):
-                if not _non_empty_str(feat.get("properties", {}).get("WADMPR")):
-                    errors.append(f"01-national/{filename} feature #{i}: missing/empty WADMPR.")
+                pr = feat.get("properties", {}).get("WADMPR")
+                if not _non_empty_str(pr):
+                    errors.append(f"{rel_path} feature #{i}: missing/empty WADMPR.")
+                labels.append(f"#{i} ({pr})")
+            if len(geoms) == len(features):
+                check_coverage(geoms, labels, rel_path, errors)
         elif key == "districts":
+            labels = []
             for i, feat in enumerate(features):
                 props = feat.get("properties", {})
-                if not _non_empty_str(props.get("WADMPR")) or not _non_empty_str(props.get("WADMKK")):
-                    errors.append(f"01-national/{filename} feature #{i}: missing/empty WADMPR or WADMKK.")
+                pr, kk = props.get("WADMPR"), props.get("WADMKK")
+                if not _non_empty_str(pr) or not _non_empty_str(kk):
+                    errors.append(f"{rel_path} feature #{i}: missing/empty WADMPR or WADMKK.")
+                labels.append(f"#{i} ({pr}/{kk})")
+            if len(geoms) == len(features):
+                check_coverage(geoms, labels, rel_path, errors)
 
-    # 2. Province-only & with-districts outputs
+    # 2. High-detail province-only & with-districts outputs (2e-05 deg)
     prov_only_files = sorted(prov_only_dir.glob("*.geojson"))
     with_dist_files = sorted(with_dist_dir.glob("*.geojson"))
     prov_only_names = {p.name for p in prov_only_files}
@@ -209,46 +264,72 @@ def main(argv: list[str] | None = None) -> int:
             f"Province filename mismatch between province-only and with-districts: only_in_province_only={only_a}, only_in_with_districts={only_b}"
         )
 
+    prov_only_geoms: list[Any] = []
+    prov_only_labels: list[str] = []
+    prov_holes_total = 0
     for path in prov_only_files:
-        features, size = validate_geojson_file(
-            path, f"02-provinces/province-only/{path.name}", max_bytes, errors
+        features, geoms, size = validate_geojson_file(
+            path, f"high-detail/02-provinces/province-only/{path.name}", max_bytes, errors
         )
         max_seen_bytes = max(max_seen_bytes, size)
         files_checked += 1
         if len(features) != 1:
             errors.append(
-                f"02-provinces/province-only/{path.name}: expected 1 feature, found {len(features)}."
+                f"high-detail/02-provinces/province-only/{path.name}: expected 1 feature, found {len(features)}."
             )
-        elif not _non_empty_str(features[0].get("properties", {}).get("WADMPR")):
-            errors.append(f"02-provinces/province-only/{path.name}: missing/empty WADMPR.")
+        else:
+            pr = features[0].get("properties", {}).get("WADMPR")
+            if not _non_empty_str(pr):
+                errors.append(f"high-detail/02-provinces/province-only/{path.name}: missing/empty WADMPR.")
+            if len(geoms) == 1:
+                prov_only_geoms.append(geoms[0])
+                prov_only_labels.append(f"{path.name} ({pr})")
+                prov_holes_total += count_interior_holes(geoms[0])
+
+    if len(prov_only_geoms) == len(prov_only_files):
+        check_coverage(prov_only_geoms, prov_only_labels, "high-detail/02-provinces/province-only (all)", errors)
 
     total_with_dist_features = 0
     for path in with_dist_files:
-        features, size = validate_geojson_file(
-            path, f"02-provinces/with-districts/{path.name}", max_bytes, errors
+        features, geoms, size = validate_geojson_file(
+            path, f"high-detail/02-provinces/with-districts/{path.name}", max_bytes, errors
         )
         max_seen_bytes = max(max_seen_bytes, size)
         files_checked += 1
         total_with_dist_features += len(features)
+        labels = []
         for i, feat in enumerate(features):
             props = feat.get("properties", {})
-            if not _non_empty_str(props.get("WADMPR")) or not _non_empty_str(props.get("WADMKK")):
+            pr, kk = props.get("WADMPR"), props.get("WADMKK")
+            if not _non_empty_str(pr) or not _non_empty_str(kk):
                 errors.append(
-                    f"02-provinces/with-districts/{path.name} feature #{i}: missing/empty WADMPR or WADMKK."
+                    f"high-detail/02-provinces/with-districts/{path.name} feature #{i}: missing/empty WADMPR or WADMKK."
                 )
+            labels.append(f"#{i} ({kk})")
+        if len(geoms) == len(features):
+            check_coverage(geoms, labels, f"high-detail/02-provinces/with-districts/{path.name}", errors)
 
-    # 3. Individual district files
+    # 3. High-detail individual district files (2e-05 deg)
     dist_files = sorted(dist_dir.glob("*.geojson"))
+    dist_geoms: list[Any] = []
+    dist_labels: list[str] = []
     for path in dist_files:
-        features, size = validate_geojson_file(path, f"03-districts/{path.name}", max_bytes, errors)
+        features, geoms, size = validate_geojson_file(path, f"high-detail/03-districts/{path.name}", max_bytes, errors)
         max_seen_bytes = max(max_seen_bytes, size)
         files_checked += 1
         if len(features) != 1:
-            errors.append(f"03-districts/{path.name}: expected 1 feature, found {len(features)}.")
+            errors.append(f"high-detail/03-districts/{path.name}: expected 1 feature, found {len(features)}.")
         else:
             props = features[0].get("properties", {})
-            if not _non_empty_str(props.get("WADMPR")) or not _non_empty_str(props.get("WADMKK")):
-                errors.append(f"03-districts/{path.name}: missing/empty WADMPR or WADMKK.")
+            pr, kk = props.get("WADMPR"), props.get("WADMKK")
+            if not _non_empty_str(pr) or not _non_empty_str(kk):
+                errors.append(f"high-detail/03-districts/{path.name}: missing/empty WADMPR or WADMKK.")
+            if len(geoms) == 1:
+                dist_geoms.append(geoms[0])
+                dist_labels.append(f"{path.name} ({pr}/{kk})")
+
+    if len(dist_geoms) == len(dist_files):
+        check_coverage(dist_geoms, dist_labels, "high-detail/03-districts (all)", errors)
 
     # 4. Cross-level consistency & expected counts
     prov_count = len(prov_only_files)
@@ -258,21 +339,23 @@ def main(argv: list[str] | None = None) -> int:
         errors.append(f"Province file count mismatch: province-only={prov_count}, with-districts={len(with_dist_files)}.")
     if "provinces" in nat_counts and nat_counts["provinces"] != prov_count:
         errors.append(
-            f"Province count mismatch: national={nat_counts['provinces']}, province-only={prov_count}."
+            f"Province count mismatch: simplified={nat_counts['provinces']}, high-detail province-only={prov_count}."
         )
     if total_with_dist_features != dist_count:
         errors.append(
-            f"District count mismatch: sum(with-districts)={total_with_dist_features}, 03-districts={dist_count}."
+            f"District count mismatch: sum(with-districts)={total_with_dist_features}, high-detail 03-districts={dist_count}."
         )
     if "districts" in nat_counts and nat_counts["districts"] != dist_count:
-        errors.append(f"District count mismatch: national={nat_counts['districts']}, 03-districts={dist_count}.")
+        errors.append(
+            f"District count mismatch: simplified={nat_counts['districts']}, high-detail 03-districts={dist_count}."
+        )
 
     if args.expected_provinces > 0 and prov_count != args.expected_provinces:
         errors.append(f"Expected {args.expected_provinces} provinces, found {prov_count}.")
     if args.expected_districts > 0 and dist_count != args.expected_districts:
         errors.append(f"Expected {args.expected_districts} districts, found {dist_count}.")
 
-    # 5. Provenance metadata check
+    # 5. Provenance metadata & topology parity check
     if not args.no_metadata:
         if not args.metadata.is_file():
             errors.append(f"Missing provenance metadata file: {args.metadata}")
@@ -288,12 +371,33 @@ def main(argv: list[str] | None = None) -> int:
                     errors.append(
                         f"Metadata counts.districts={meta_counts.get('districts')} does not match {dist_count}."
                     )
+                topo = meta.get("topology")
+                if isinstance(topo, dict):
+                    if topo.get("country_interior_holes") != country_holes:
+                        errors.append(
+                            f"Metadata topology.country_interior_holes={topo.get('country_interior_holes')} "
+                            f"does not match observed {country_holes}."
+                        )
+                    if topo.get("province_interior_holes_total") != prov_holes_total:
+                        errors.append(
+                            f"Metadata topology.province_interior_holes_total={topo.get('province_interior_holes_total')} "
+                            f"does not match observed {prov_holes_total}."
+                        )
+                    for bool_key in (
+                        "districts_detail_coverage_valid",
+                        "provinces_detail_coverage_valid",
+                        "districts_simplified_coverage_valid",
+                        "provinces_simplified_coverage_valid",
+                    ):
+                        if topo.get(bool_key) is not True:
+                            errors.append(f"Metadata topology.{bool_key} is {topo.get(bool_key)!r}, expected True.")
             except Exception as exc:
                 errors.append(f"Failed to parse metadata file {args.metadata}: {exc}")
 
     print(
         f"Validation checked {files_checked} GeoJSON files: "
         f"{prov_count} provinces, {dist_count} districts, "
+        f"country holes={country_holes}, province holes={prov_holes_total}, "
         f"max file size {max_seen_bytes / 1_000_000:.2f} MB."
     )
     if errors:

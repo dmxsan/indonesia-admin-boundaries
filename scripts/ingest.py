@@ -4,8 +4,12 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
+import gc
+import gzip
 import hashlib
 import json
+import os
 import re
 import sys
 import tempfile
@@ -15,13 +19,14 @@ import xml.etree.ElementTree as ET
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 import geopandas as gpd
+import numpy as np
 import pandas as pd
 import pyogrio
 import shapely
-from shapely.geometry import MultiPolygon, mapping
+from shapely.geometry import MultiPolygon
 from shapely.ops import unary_union
 
 DEFAULT_BIG_URL = "https://drive.big.go.id/s/9x9dJWSNfQ3wp7S/download"
@@ -30,6 +35,7 @@ DEFAULT_DISCLAIMER = "Data batas yang berstatus indikatif tidak dapat dijadikan 
 PROVINCE_CODE_COLS = ["KDPPUM", "KDPBPS"]
 DISTRICT_CODE_COLS = ["KDPPUM", "KDPKAB", "KDPBPS", "KDBBPS"]
 NULL_TOKENS = {"", "none", "null", "nan"}
+LARGE_COMPONENT_COORDS = 3_000_000
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -81,10 +87,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--precision", type=int, default=6, help="GeoJSON coordinate decimal places.")
     parser.add_argument(
+        "--detail-simplify-tolerance",
+        type=float,
+        default=2e-05,
+        help="Coverage simplification tolerance (degrees) for high-detail/ outputs.",
+    )
+    parser.add_argument(
         "--simplify-tolerance",
         type=float,
         default=0.001,
-        help="Topology-preserving simplification tolerance (degrees) for 01-national/ outputs.",
+        help="Coverage simplification tolerance (degrees) for simplified/ nationwide outputs.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=min(4, os.cpu_count() or 1),
+        help="Number of worker threads for parallel component/release processing.",
     )
     parser.add_argument("--edition", default=None, help="Optional edition label override.")
 
@@ -93,8 +111,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("Provide --input PATH or --download.")
     if args.precision < 0:
         parser.error("--precision must be >= 0.")
+    if args.detail_simplify_tolerance < 0:
+        parser.error("--detail-simplify-tolerance must be >= 0.")
     if args.simplify_tolerance < 0:
         parser.error("--simplify-tolerance must be >= 0.")
+    if args.workers < 1:
+        parser.error("--workers must be >= 1.")
     return args
 
 
@@ -130,7 +152,7 @@ def download_file(url: str, dest_dir: Path, fallback_name: str, force: bool = Fa
     if filename:
         dest_path = dest_dir / filename
         if dest_path.exists() and not force:
-            print(f"Using existing download: {dest_path}")
+            print(f"Using existing download: {dest_path}", flush=True)
             return dest_path
 
     get_req = urllib.request.Request(url, headers=headers)
@@ -138,7 +160,7 @@ def download_file(url: str, dest_dir: Path, fallback_name: str, force: bool = Fa
         resolved_name = filename or _filename_from_cd(resp.headers.get("Content-Disposition")) or fallback_name
         dest_path = dest_dir / Path(resolved_name).name
         if dest_path.exists() and not force:
-            print(f"Using existing download: {dest_path}")
+            print(f"Using existing download: {dest_path}", flush=True)
             return dest_path
 
         part_path = dest_path.with_suffix(dest_path.suffix + ".part")
@@ -148,7 +170,7 @@ def download_file(url: str, dest_dir: Path, fallback_name: str, force: bool = Fa
                 out.write(chunk)
                 total += len(chunk)
         part_path.replace(dest_path)
-        print(f"Downloaded {dest_path} ({total / 1_000_000:.2f} MB)")
+        print(f"Downloaded {dest_path} ({total / 1_000_000:.2f} MB)", flush=True)
         return dest_path
 
 
@@ -284,10 +306,54 @@ def _extract_polygonal(geom: Any) -> Any:
     return None
 
 
-def clean_geometry(geom: Any) -> Any:
+def _round_geom_2d(geom: Any, precision: int) -> Any:
+    return shapely.transform(geom, lambda coords: np.round(coords, precision) + 0.0)
+
+
+def count_interior_holes(geom: Any) -> int:
+    if geom is None or geom.is_empty:
+        return 0
+    if geom.geom_type == "Polygon":
+        return len(geom.interiors)
+    if geom.geom_type == "MultiPolygon":
+        return sum(len(poly.interiors) for poly in geom.geoms)
+    return 0
+
+
+def _orient_ccw(geom: Any) -> Any:
+    if hasattr(shapely, "orient_polygons"):
+        return shapely.orient_polygons(geom, exterior_cw=False)
+    return geom
+
+
+def _verify_json_roundtrip(geom: Any, precision: int) -> Any:
+    grid = 10 ** (-precision)
+    cur = geom
+    for _ in range(3):
+        rounded_geom = _round_geom_2d(cur, precision)
+        if not rounded_geom.is_empty and rounded_geom.is_valid:
+            return _orient_ccw(rounded_geom)
+        repaired = _extract_polygonal(shapely.make_valid(rounded_geom))
+        if repaired is None or repaired.is_empty:
+            return None
+        repaired = shapely.set_precision(repaired, grid)
+        repaired = _extract_polygonal(shapely.make_valid(repaired) if not repaired.is_valid else repaired)
+        if repaired is None or repaired.is_empty:
+            return None
+        cur = repaired
+
+    rounded_geom = _round_geom_2d(cur, precision)
+    if rounded_geom.is_empty or not rounded_geom.is_valid:
+        return None
+    return _orient_ccw(rounded_geom)
+
+
+def clean_geometry(geom: Any, precision: int | None = None) -> Any:
     if geom is None or geom.is_empty:
         return None
     geom = shapely.force_2d(geom)
+    if precision is not None:
+        geom = shapely.set_precision(geom, 10 ** (-precision))
     if not geom.is_valid:
         geom = shapely.make_valid(geom)
     geom = _extract_polygonal(geom)
@@ -297,18 +363,251 @@ def clean_geometry(geom: Any) -> Any:
         geom = _extract_polygonal(shapely.make_valid(geom))
         if geom is None or geom.is_empty:
             return None
-    if hasattr(shapely, "orient_polygons"):
-        geom = shapely.orient_polygons(geom, exterior_cw=False)
-    return geom
+    if precision is not None:
+        return _verify_json_roundtrip(geom, precision)
+    return _orient_ccw(geom)
 
 
-def simplify_polygonal(geom: Any, tolerance: float) -> Any:
+def simplify_polygonal(geom: Any, tolerance: float, precision: int | None = None) -> Any:
     if tolerance <= 0:
-        return geom
-    simplified = clean_geometry(geom.simplify(tolerance, preserve_topology=True))
+        return clean_geometry(geom, precision=precision)
+    simplified = clean_geometry(geom.simplify(tolerance, preserve_topology=True), precision=precision)
     if simplified is None or simplified.is_empty:
-        return geom
+        return clean_geometry(geom, precision=precision)
     return simplified
+
+
+def _connected_components(geoms: list[Any], pad: float = 0.002) -> list[list[int]]:
+    n = len(geoms)
+    if n == 0:
+        return []
+    if n == 1:
+        return [[0]]
+
+    tree = shapely.STRtree(geoms)
+    left, right = tree.query(geoms, predicate="dwithin", distance=pad)
+
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for i, j in zip(left.tolist(), right.tolist()):
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            if ri < rj:
+                parent[rj] = ri
+            else:
+                parent[ri] = rj
+
+    groups: dict[int, list[int]] = {}
+    for idx in range(n):
+        groups.setdefault(find(idx), []).append(idx)
+    return [groups[k] for k in sorted(groups)]
+
+
+def _run_components(
+    geoms: list[Any],
+    components: list[list[int]],
+    fn: Any,
+    workers: int,
+) -> list[Any]:
+    result: list[Any] = [None] * len(geoms)
+    if workers <= 1 or len(components) <= 1:
+        for comp in components:
+            comp_geoms = [geoms[i] for i in comp]
+            comp_out = fn(comp_geoms)
+            for idx, out_g in zip(comp, comp_out):
+                result[idx] = out_g
+            del comp_geoms, comp_out
+            gc.collect()
+        return result
+
+    sized = sorted(
+        ((sum(int(shapely.get_num_coordinates(geoms[i])) for i in comp), comp) for comp in components),
+        key=lambda item: item[0],
+        reverse=True,
+    )
+    large_comps = [comp for pts, comp in sized if pts >= LARGE_COMPONENT_COORDS]
+    small_comps = [comp for pts, comp in sized if pts < LARGE_COMPONENT_COORDS]
+
+    # Isolate large components sequentially so multiple multi-million-vertex GEOS graphs don't spike RAM.
+    for comp in large_comps:
+        comp_geoms = [geoms[i] for i in comp]
+        comp_out = fn(comp_geoms)
+        for idx, out_g in zip(comp, comp_out):
+            result[idx] = out_g
+        del comp_geoms, comp_out
+        gc.collect()
+
+    if len(small_comps) == 1:
+        comp = small_comps[0]
+        comp_geoms = [geoms[i] for i in comp]
+        comp_out = fn(comp_geoms)
+        for idx, out_g in zip(comp, comp_out):
+            result[idx] = out_g
+        del comp_geoms, comp_out
+        gc.collect()
+    elif small_comps:
+        with ThreadPoolExecutor(max_workers=min(workers, len(small_comps))) as ex:
+            futures = [(comp, ex.submit(fn, [geoms[i] for i in comp])) for comp in small_comps]
+            for comp, fut in futures:
+                for idx, out_g in zip(comp, fut.result()):
+                    result[idx] = out_g
+        gc.collect()
+
+    return result
+
+
+def _clean_coverage_component(comp_geoms: list[Any], precision: int | None) -> list[Any]:
+    if len(comp_geoms) == 1:
+        cleaned_single = clean_geometry(comp_geoms[0], precision=precision)
+        if cleaned_single is None:
+            raise ValueError("Single geometry became empty during cleaning.")
+        return [cleaned_single]
+
+    if precision is None:
+        if shapely.coverage_is_valid(comp_geoms):
+            result: list[Any] = []
+            for idx, g in enumerate(comp_geoms):
+                out_g = _orient_ccw(g) if (g is not None and not g.is_empty and g.is_valid) else clean_geometry(g, precision=None)
+                if out_g is None:
+                    raise ValueError(f"Geometry became empty at component index {idx}.")
+                result.append(out_g)
+            return result
+
+        cleaned = list(shapely.coverage_clean(comp_geoms))
+        result = []
+        for idx, cg in enumerate(cleaned):
+            g = _extract_polygonal(cg)
+            if g is None or g.is_empty:
+                g = clean_geometry(comp_geoms[idx], precision=None)
+            elif not g.is_valid:
+                g = clean_geometry(g, precision=None)
+            else:
+                g = _orient_ccw(g)
+            if g is None:
+                raise ValueError(f"Coverage cleaning produced empty geometry at component index {idx}.")
+            result.append(g)
+        return result
+
+    grid = 10 ** (-precision)
+    snapped = [_extract_polygonal(shapely.set_precision(g, grid)) or g for g in comp_geoms]
+    cleaned = list(shapely.coverage_clean(snapped))
+    result = []
+    for idx, cg in enumerate(cleaned):
+        g = _extract_polygonal(cg)
+        if g is None or g.is_empty:
+            g = _extract_polygonal(shapely.set_precision(comp_geoms[idx], grid)) or comp_geoms[idx]
+        verified = _verify_json_roundtrip(g, precision)
+        if verified is None:
+            verified = clean_geometry(comp_geoms[idx], precision=precision)
+        if verified is None:
+            raise ValueError(f"Coverage precision rounding produced empty geometry at component index {idx}.")
+        result.append(verified)
+
+    if len(result) >= 2 and not shapely.coverage_is_valid(result):
+        recleaned = list(shapely.coverage_clean(result))
+        refined: list[Any] = []
+        for idx, cg in enumerate(recleaned):
+            g = _extract_polygonal(cg)
+            if g is None or g.is_empty:
+                refined.append(result[idx])
+                continue
+            verified = _verify_json_roundtrip(g, precision)
+            refined.append(verified if verified is not None else result[idx])
+        result = refined
+
+    return result
+
+
+def clean_coverage_geometries(
+    geoms: list[Any],
+    precision: int | None = None,
+    pad: float = 0.002,
+    workers: int = 1,
+) -> list[Any]:
+    if not geoms:
+        return []
+    components = _connected_components(geoms, pad=pad)
+    effective_workers = workers if precision is not None else 1
+    return _run_components(
+        geoms,
+        components,
+        lambda comp_geoms: _clean_coverage_component(comp_geoms, precision=precision),
+        workers=effective_workers,
+    )
+
+
+def _simplify_coverage_component(comp_geoms: list[Any], tolerance: float, precision: int) -> list[Any]:
+    if len(comp_geoms) == 1:
+        simplified = simplify_polygonal(comp_geoms[0], tolerance, precision=precision)
+        if simplified is None:
+            raise ValueError("Single geometry became empty during simplification.")
+        return [simplified]
+
+    simplified_raw = list(shapely.coverage_simplify(comp_geoms, tolerance))
+    non_empty = [
+        sg if (sg is not None and not sg.is_empty) else comp_geoms[idx]
+        for idx, sg in enumerate(simplified_raw)
+    ]
+    return _clean_coverage_component(non_empty, precision=precision)
+
+
+def simplify_coverage_geometries(
+    geoms: list[Any],
+    tolerance: float,
+    precision: int,
+    workers: int = 1,
+) -> list[Any]:
+    if not geoms:
+        return []
+    pad = max(tolerance * 5, 0.002)
+    if tolerance <= 0:
+        return clean_coverage_geometries(geoms, precision=precision, pad=pad, workers=workers)
+
+    components = _connected_components(geoms, pad=pad)
+    return _run_components(
+        geoms,
+        components,
+        lambda comp_geoms: _simplify_coverage_component(comp_geoms, tolerance, precision),
+        workers=workers,
+    )
+
+
+def _safe_coverage_union(geoms: list[Any]) -> Any:
+    if len(geoms) == 1:
+        return geoms[0]
+    try:
+        return shapely.coverage_union_all(geoms)
+    except Exception:
+        return unary_union(geoms)
+
+
+def dissolve_coverage_by(
+    gdf: gpd.GeoDataFrame,
+    group_col: str,
+    code_cols: list[str],
+    precision: int | None = None,
+    workers: int = 1,
+) -> gpd.GeoDataFrame:
+    rows: list[dict[str, Any]] = []
+    for key in sorted(gdf[group_col].unique()):
+        sub = gdf.loc[gdf[group_col] == key]
+        merged = _safe_coverage_union(list(sub.geometry))
+        merged = _extract_polygonal(merged) or clean_geometry(merged, precision=None)
+        row: dict[str, Any] = {group_col: key}
+        for col in code_cols:
+            row[col] = first_non_null(sub[col])
+        row["geometry"] = merged
+        rows.append(row)
+
+    out_gdf = gpd.GeoDataFrame(rows, geometry="geometry", crs="EPSG:4326")
+    out_gdf["geometry"] = clean_coverage_geometries(list(out_gdf["geometry"]), precision=precision, workers=workers)
+    return out_gdf.sort_values([group_col]).reset_index(drop=True)
 
 
 def clean_str(val: Any) -> str | None:
@@ -331,14 +630,6 @@ def sanitize_filename(name: str) -> str:
     return cleaned or "unnamed"
 
 
-def _round_coords_2d(coords: Any, precision: int) -> Any:
-    if isinstance(coords, (list, tuple)):
-        if coords and isinstance(coords[0], (int, float)):
-            return [round(float(coords[0]), precision), round(float(coords[1]), precision)]
-        return [_round_coords_2d(item, precision) for item in coords]
-    return coords
-
-
 def _json_scalar(val: Any) -> Any:
     if val is None or pd.isna(val):
         return None
@@ -347,22 +638,54 @@ def _json_scalar(val: Any) -> Any:
     return val
 
 
-def write_geojson(gdf: gpd.GeoDataFrame, path: Path, precision: int) -> int:
-    path.parent.mkdir(parents=True, exist_ok=True)
+def stream_geojson(gdf: gpd.GeoDataFrame, fp: BinaryIO, precision: int | None) -> None:
     prop_cols = [c for c in gdf.columns if c != gdf.geometry.name]
-    features: list[dict[str, Any]] = []
-    for _, row in gdf.iterrows():
-        geom_obj = row[gdf.geometry.name]
-        geom_dict = mapping(geom_obj)
-        geom_dict["coordinates"] = _round_coords_2d(geom_dict["coordinates"], precision)
-        props = {col: _json_scalar(row[col]) for col in prop_cols}
-        features.append({"type": "Feature", "properties": props, "geometry": geom_dict})
+    geoms = gdf[gdf.geometry.name].tolist()
+    col_vals = [gdf[c].tolist() for c in prop_cols]
 
-    payload = {"type": "FeatureCollection", "features": features}
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(payload, f, separators=(",", ":"), ensure_ascii=False)
-        f.write("\n")
+    fp.write(b'{"type":"FeatureCollection","features":[')
+    for idx, geom_obj in enumerate(geoms):
+        if idx > 0:
+            fp.write(b",")
+        props = {col: _json_scalar(col_vals[j][idx]) for j, col in enumerate(prop_cols)}
+        props_bytes = json.dumps(props, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        if precision is None:
+            # Stream C++ Shapely GeoJSON directly so multi-million-vertex polygons avoid Python dict bloat.
+            geom_bytes = shapely.to_geojson(geom_obj).encode("utf-8")
+        else:
+            geom_bytes = shapely.to_geojson(_round_geom_2d(geom_obj, precision)).encode("utf-8")
+
+        fp.write(b'{"type":"Feature","properties":')
+        fp.write(props_bytes)
+        fp.write(b',"geometry":')
+        fp.write(geom_bytes)
+        fp.write(b"}")
+    fp.write(b"]}\n")
+
+
+def write_geojson(gdf: gpd.GeoDataFrame, path: Path, precision: int | None) -> int:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.suffix.lower() == ".gz":
+        with gzip.open(path, "wb", compresslevel=6) as f:
+            stream_geojson(gdf, f, precision)
+    else:
+        with open(path, "wb") as f:
+            stream_geojson(gdf, f, precision)
     return path.stat().st_size
+
+
+def _district_filenames(districts_gdf: gpd.GeoDataFrame) -> list[str]:
+    base_names = [sanitize_filename(str(v)) for v in districts_gdf["WADMKK"]]
+    name_counts = pd.Series(base_names).value_counts().to_dict()
+    filenames: list[str] = []
+    for idx in range(len(districts_gdf)):
+        prov_name = str(districts_gdf.iloc[idx]["WADMPR"])
+        base = base_names[idx]
+        if name_counts.get(base, 0) > 1:
+            filenames.append(f"{base}__{sanitize_filename(prov_name)}.geojson")
+        else:
+            filenames.append(f"{base}.geojson")
+    return filenames
 
 
 def _clear_geojson_dir(directory: Path) -> None:
@@ -377,16 +700,13 @@ def _dir_stats(directory: Path) -> dict[str, int]:
     return {"file_count": len(files), "max_file_bytes": max(sizes) if sizes else 0}
 
 
-def build_datasets(
-    dataset_path: Path,
-    layer_name: str,
-    simplify_tolerance: float,
-) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame, dict[str, Any]]:
+def load_full_districts(dataset_path: Path, layer_name: str) -> tuple[gpd.GeoDataFrame, dict[str, Any]]:
     gdf = gpd.read_file(dataset_path, layer=layer_name, engine="pyogrio")
     raw_feature_count = len(gdf)
+    print(f"Loaded {raw_feature_count} raw features; cleaning and normalizing...", flush=True)
 
     if gdf.crs is None:
-        print("Warning: dataset has no CRS; assuming EPSG:4326.", file=sys.stderr)
+        print("Warning: dataset has no CRS; assuming EPSG:4326.", file=sys.stderr, flush=True)
         gdf = gdf.set_crs(epsg=4326)
     elif gdf.crs.to_epsg() != 4326:
         gdf = gdf.to_crs(epsg=4326)
@@ -401,7 +721,7 @@ def build_datasets(
     for col in norm_cols:
         gdf[col] = gdf[col].map(clean_str)
 
-    gdf["geometry"] = gdf["geometry"].map(clean_geometry)
+    gdf["geometry"] = gdf["geometry"].map(lambda g: clean_geometry(g, precision=None))
     empty_geom_mask = gdf["geometry"].isna()
     dropped_empty_geometries = int(empty_geom_mask.sum())
     gdf = gdf.loc[~empty_geom_mask].copy()
@@ -421,49 +741,233 @@ def build_datasets(
     if valid_gdf.empty:
         raise ValueError("No valid district features remain after filtering empty geometries and null names.")
 
+    print("Dissolving full-resolution districts...", flush=True)
     dist_code_cols = [c for c in DISTRICT_CODE_COLS if c in valid_gdf.columns]
     dist_cols = ["WADMPR", "WADMKK", *dist_code_cols, "geometry"]
     if dist_code_cols:
-        districts_gdf = valid_gdf[dist_cols].dissolve(
+        districts_full = valid_gdf[dist_cols].dissolve(
             by=["WADMPR", "WADMKK"],
             aggfunc={c: first_non_null for c in dist_code_cols},
             as_index=False,
         )
     else:
-        districts_gdf = valid_gdf[dist_cols].dissolve(by=["WADMPR", "WADMKK"], as_index=False)
+        districts_full = valid_gdf[dist_cols].dissolve(by=["WADMPR", "WADMKK"], as_index=False)
 
-    districts_gdf["geometry"] = districts_gdf["geometry"].map(clean_geometry)
-    districts_gdf = districts_gdf.loc[~districts_gdf["geometry"].isna()].copy()
-    districts_gdf = districts_gdf.set_crs(epsg=4326, allow_override=True)
-    districts_gdf = districts_gdf.sort_values(["WADMPR", "WADMKK"]).reset_index(drop=True)
+    del gdf, valid_gdf
+    gc.collect()
 
-    prov_code_cols = [c for c in PROVINCE_CODE_COLS if c in districts_gdf.columns]
-    prov_cols = ["WADMPR", *prov_code_cols, "geometry"]
-    if prov_code_cols:
-        provinces_gdf = districts_gdf[prov_cols].dissolve(
-            by=["WADMPR"],
-            aggfunc={c: first_non_null for c in prov_code_cols},
-            as_index=False,
+    districts_full["geometry"] = districts_full["geometry"].map(lambda g: clean_geometry(g, precision=None))
+    districts_full = districts_full.loc[~districts_full["geometry"].isna()].copy()
+    districts_full = districts_full.set_crs(epsg=4326, allow_override=True)
+    districts_full = districts_full.sort_values(["WADMPR", "WADMKK"]).reset_index(drop=True)
+
+    print("Cleaning full-resolution district coverage by connected components...", flush=True)
+    districts_full["geometry"] = clean_coverage_geometries(list(districts_full["geometry"]), precision=None, workers=1)
+
+    raw_counts = {
+        "raw_features": int(raw_feature_count),
+        "dropped_empty_geometries": dropped_empty_geometries,
+        "dropped_null_wadmpr": dropped_null_wadmpr,
+        "dropped_null_wadmkk": dropped_null_wadmkk,
+        "dropped_null_wadmkk_by_province": dropped_null_wadmkk_by_province,
+    }
+    return districts_full, raw_counts
+
+
+def _zip_gpkg(src_gpkg: Path, zip_path: Path) -> Path:
+    try:
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+            zf.write(src_gpkg, arcname="indonesia_admin_boundaries.gpkg")
+    finally:
+        if src_gpkg.exists():
+            src_gpkg.unlink()
+    print(f"Wrote {zip_path.name} ({zip_path.stat().st_size / 1_000_000:.2f} MB)", flush=True)
+    return zip_path
+
+
+def _write_gz_release_asset(path: Path, frame: gpd.GeoDataFrame) -> Path:
+    size = write_geojson(frame, path, None)
+    print(f"Wrote {path.name} ({size / 1_000_000:.2f} MB)", flush=True)
+    return path
+
+
+def _write_provinces_only_zip(zip_path: Path, provinces_full: gpd.GeoDataFrame) -> Path:
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+        for idx in range(len(provinces_full)):
+            prov_row_df = provinces_full.iloc[[idx]]
+            prov_name = str(prov_row_df.iloc[0]["WADMPR"])
+            arcname = f"02-provinces/province-only/{sanitize_filename(prov_name)}.geojson"
+            with zf.open(arcname, "w", force_zip64=True) as entry_fp:
+                stream_geojson(prov_row_df, entry_fp, None)
+    print(f"Wrote {zip_path.name} ({zip_path.stat().st_size / 1_000_000:.2f} MB)", flush=True)
+    return zip_path
+
+
+def _write_provinces_with_districts_zip(
+    zip_path: Path,
+    provinces_full: gpd.GeoDataFrame,
+    districts_full: gpd.GeoDataFrame,
+    prov_to_dist_indices: dict[str, list[int]],
+) -> Path:
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+        for idx in range(len(provinces_full)):
+            prov_name = str(provinces_full.iloc[idx]["WADMPR"])
+            arcname = f"02-provinces/with-districts/{sanitize_filename(prov_name)}.geojson"
+            prov_districts = districts_full.iloc[prov_to_dist_indices[prov_name]]
+            with zf.open(arcname, "w", force_zip64=True) as entry_fp:
+                stream_geojson(prov_districts, entry_fp, None)
+    print(f"Wrote {zip_path.name} ({zip_path.stat().st_size / 1_000_000:.2f} MB)", flush=True)
+    return zip_path
+
+
+def _write_districts_zip(zip_path: Path, districts_full: gpd.GeoDataFrame) -> Path:
+    filenames = _district_filenames(districts_full)
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+        for idx, filename in enumerate(filenames):
+            arcname = f"03-districts/{filename}"
+            with zf.open(arcname, "w", force_zip64=True) as entry_fp:
+                stream_geojson(districts_full.iloc[[idx]], entry_fp, None)
+    print(f"Wrote {zip_path.name} ({zip_path.stat().st_size / 1_000_000:.2f} MB)", flush=True)
+    return zip_path
+
+
+def write_dist_release_assets(
+    dist_dir: Path,
+    districts_full: gpd.GeoDataFrame,
+    prov_code_cols: list[str],
+    workers: int,
+) -> None:
+    dist_dir.mkdir(parents=True, exist_ok=True)
+    for stale_name in (
+        "indonesia_admin_boundaries.gpkg",
+        "indonesia_admin_boundaries.gpkg.zip",
+        "_tmp_indonesia_admin_boundaries.gpkg",
+        "indonesia_country.geojson.gz",
+        "indonesia_provinces.geojson",
+        "indonesia_provinces.geojson.gz",
+        "indonesia_districts.geojson",
+        "indonesia_districts.geojson.gz",
+        "official-provinces-only.zip",
+        "official-provinces-with-districts.zip",
+        "official-districts.zip",
+        "SHA256SUMS.txt",
+    ):
+        stale_path = dist_dir / stale_name
+        if stale_path.exists():
+            stale_path.unlink()
+
+    print("Dissolving full-resolution provinces and national outline...", flush=True)
+    provinces_full = dissolve_coverage_by(districts_full, "WADMPR", prov_code_cols, precision=None, workers=1)
+    country_full_geom = clean_geometry(_safe_coverage_union(list(provinces_full["geometry"])), precision=None)
+    if country_full_geom is None:
+        raise ValueError("Failed to dissolve full-resolution provinces into national outline.")
+    country_full = gpd.GeoDataFrame(
+        [{"name": "Indonesia", "iso_a2": "ID", "iso_a3": "IDN", "geometry": country_full_geom}],
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+    del country_full_geom
+
+    print(f"Writing official unsimplified dist/ release assets (workers={workers})...", flush=True)
+    tmp_gpkg = dist_dir / "_tmp_indonesia_admin_boundaries.gpkg"
+    gpkg_zip_path = dist_dir / "official_all-levels_indonesia.gpkg.zip"
+    asset_paths: list[Path] = []
+    try:
+        country_full.to_file(tmp_gpkg, layer="country", driver="GPKG", engine="pyogrio")
+        # Write the massive single-feature country GeoJSON solo so its transient buffer never overlaps worker threads.
+        asset_paths.append(
+            _write_gz_release_asset(dist_dir / "official_01-national_indonesia_merged.geojson.gz", country_full)
         )
-    else:
-        provinces_gdf = districts_gdf[prov_cols].dissolve(by=["WADMPR"], as_index=False)
+        del country_full
+        gc.collect()
 
-    provinces_gdf["geometry"] = provinces_gdf["geometry"].map(clean_geometry)
-    provinces_gdf = provinces_gdf.loc[~provinces_gdf["geometry"].isna()].copy()
-    provinces_gdf = provinces_gdf.set_crs(epsg=4326, allow_override=True)
-    provinces_gdf = provinces_gdf.sort_values(["WADMPR"]).reset_index(drop=True)
+        provinces_full.to_file(tmp_gpkg, layer="provinces", driver="GPKG", engine="pyogrio")
+        districts_full.to_file(tmp_gpkg, layer="districts", driver="GPKG", engine="pyogrio")
 
-    provinces_simplified = provinces_gdf.copy()
-    provinces_simplified["geometry"] = provinces_simplified["geometry"].map(
-        lambda g: simplify_polygonal(g, simplify_tolerance)
+        prov_to_dist_indices: dict[str, list[int]] = {}
+        for pos, prov_val in enumerate(districts_full["WADMPR"].tolist()):
+            prov_to_dist_indices.setdefault(str(prov_val), []).append(pos)
+
+        tasks = [
+            (_zip_gpkg, (tmp_gpkg, gpkg_zip_path)),
+            (_write_gz_release_asset, (dist_dir / "official_02-provinces_merged.geojson.gz", provinces_full)),
+            (_write_gz_release_asset, (dist_dir / "official_03-districts_merged.geojson.gz", districts_full)),
+            (_write_provinces_only_zip, (dist_dir / "official_02-provinces_split-by-province.zip", provinces_full)),
+            (
+                _write_provinces_with_districts_zip,
+                (
+                    dist_dir / "official_02-provinces_split-with-districts.zip",
+                    provinces_full,
+                    districts_full,
+                    prov_to_dist_indices,
+                ),
+            ),
+            (_write_districts_zip, (dist_dir / "official_03-districts_split-by-district.zip", districts_full)),
+        ]
+
+        if workers > 1:
+            with ThreadPoolExecutor(max_workers=min(workers, 3)) as ex:
+                futures = [ex.submit(fn, *fn_args) for fn, fn_args in tasks]
+                for fut in futures:
+                    asset_paths.append(fut.result())
+        else:
+            for fn, fn_args in tasks:
+                asset_paths.append(fn(*fn_args))
+    finally:
+        if tmp_gpkg.exists():
+            tmp_gpkg.unlink()
+
+    checksum_lines = [
+        f"{compute_sha256(p)}  {p.name}\n"
+        for p in sorted(asset_paths, key=lambda x: x.name)
+    ]
+    (dist_dir / "SHA256SUMS.txt").write_text("".join(checksum_lines), encoding="utf-8")
+
+    del provinces_full
+    gc.collect()
+
+
+def build_derived_tiers(
+    districts_detail: gpd.GeoDataFrame,
+    prov_code_cols: list[str],
+    simplify_tolerance: float,
+    precision: int,
+    workers: int,
+) -> tuple[
+    gpd.GeoDataFrame,
+    gpd.GeoDataFrame,
+    gpd.GeoDataFrame,
+    gpd.GeoDataFrame,
+    dict[str, Any],
+]:
+    provinces_detail = dissolve_coverage_by(
+        districts_detail,
+        "WADMPR",
+        prov_code_cols,
+        precision=precision,
+        workers=workers,
     )
 
-    districts_simplified = districts_gdf.copy()
-    districts_simplified["geometry"] = districts_simplified["geometry"].map(
-        lambda g: simplify_polygonal(g, simplify_tolerance)
+    print(
+        f"Building national web-simplified coverage tier (tolerance={simplify_tolerance}, workers={workers})...",
+        flush=True,
+    )
+    districts_simplified = districts_detail.copy()
+    districts_simplified["geometry"] = simplify_coverage_geometries(
+        list(districts_detail["geometry"]),
+        simplify_tolerance,
+        precision=precision,
+        workers=workers,
+    )
+    provinces_simplified = dissolve_coverage_by(
+        districts_simplified,
+        "WADMPR",
+        prov_code_cols,
+        precision=precision,
+        workers=workers,
     )
 
-    country_geom = clean_geometry(unary_union(list(provinces_simplified["geometry"])))
+    country_geom = clean_geometry(_safe_coverage_union(list(provinces_simplified["geometry"])), precision=precision)
     if country_geom is None:
         raise ValueError("Failed to dissolve provinces into national outline.")
     country_simplified = gpd.GeoDataFrame(
@@ -472,84 +976,77 @@ def build_datasets(
         crs="EPSG:4326",
     )
 
-    counts = {
-        "raw_features": int(raw_feature_count),
-        "dropped_empty_geometries": dropped_empty_geometries,
-        "dropped_null_wadmpr": dropped_null_wadmpr,
-        "dropped_null_wadmkk": dropped_null_wadmkk,
-        "dropped_null_wadmkk_by_province": dropped_null_wadmkk_by_province,
-        "provinces": int(len(provinces_gdf)),
-        "districts": int(len(districts_gdf)),
+    holes_by_prov = {
+        str(row["WADMPR"]): h
+        for _, row in provinces_detail.iterrows()
+        if (h := count_interior_holes(row["geometry"])) > 0
     }
-    return (
-        country_simplified,
-        provinces_simplified,
-        districts_simplified,
-        provinces_gdf,
-        districts_gdf,
-        counts,
-    )
+    topology = {
+        "method": "coverage_clean + coverage_simplify + coverage_union_all",
+        "districts_detail_coverage_valid": bool(
+            len(districts_detail) < 2 or shapely.coverage_is_valid(list(districts_detail["geometry"]))
+        ),
+        "provinces_detail_coverage_valid": bool(
+            len(provinces_detail) < 2 or shapely.coverage_is_valid(list(provinces_detail["geometry"]))
+        ),
+        "districts_simplified_coverage_valid": bool(
+            len(districts_simplified) < 2 or shapely.coverage_is_valid(list(districts_simplified["geometry"]))
+        ),
+        "provinces_simplified_coverage_valid": bool(
+            len(provinces_simplified) < 2 or shapely.coverage_is_valid(list(provinces_simplified["geometry"]))
+        ),
+        "country_interior_holes": count_interior_holes(country_geom),
+        "province_interior_holes_total": sum(holes_by_prov.values()),
+        "province_interior_holes_by_province": holes_by_prov,
+    }
+    return country_simplified, provinces_simplified, districts_simplified, provinces_detail, topology
 
 
-def write_all_outputs(
+def write_processed_outputs(
     output_dir: Path,
-    dist_dir: Path,
-    skip_dist: bool,
     precision: int,
     country_simplified: gpd.GeoDataFrame,
     provinces_simplified: gpd.GeoDataFrame,
     districts_simplified: gpd.GeoDataFrame,
-    provinces_gdf: gpd.GeoDataFrame,
-    districts_gdf: gpd.GeoDataFrame,
+    provinces_detail: gpd.GeoDataFrame,
+    districts_detail: gpd.GeoDataFrame,
 ) -> dict[str, dict[str, int]]:
-    nat_dir = output_dir / "01-national"
-    prov_only_dir = output_dir / "02-provinces" / "province-only"
-    with_dist_dir = output_dir / "02-provinces" / "with-districts"
-    dist_split_dir = output_dir / "03-districts"
+    simp_nat_dir = output_dir / "simplified" / "01-national"
+    simp_prov_dir = output_dir / "simplified" / "02-provinces"
+    simp_dist_dir = output_dir / "simplified" / "03-districts"
+    prov_only_dir = output_dir / "high-detail" / "02-provinces" / "province-only"
+    with_dist_dir = output_dir / "high-detail" / "02-provinces" / "with-districts"
+    dist_split_dir = output_dir / "high-detail" / "03-districts"
 
-    for d in (nat_dir, prov_only_dir, with_dist_dir, dist_split_dir):
+    for d in (simp_nat_dir, simp_prov_dir, simp_dist_dir, prov_only_dir, with_dist_dir, dist_split_dir):
         _clear_geojson_dir(d)
 
-    write_geojson(country_simplified, nat_dir / "indonesia_country_simplified.geojson", precision)
-    write_geojson(provinces_simplified, nat_dir / "indonesia_provinces_simplified.geojson", precision)
-    write_geojson(districts_simplified, nat_dir / "indonesia_districts_simplified.geojson", precision)
+    print("Writing processed-data/ GeoJSON files...", flush=True)
+    write_geojson(country_simplified, simp_nat_dir / "indonesia.geojson", precision)
+    write_geojson(provinces_simplified, simp_prov_dir / "indonesia_provinces.geojson", precision)
+    write_geojson(districts_simplified, simp_dist_dir / "indonesia_districts.geojson", precision)
 
-    for idx in range(len(provinces_gdf)):
-        prov_row_df = provinces_gdf.iloc[[idx]]
+    for idx in range(len(provinces_detail)):
+        prov_row_df = provinces_detail.iloc[[idx]]
         prov_name = str(prov_row_df.iloc[0]["WADMPR"])
         prov_filename = f"{sanitize_filename(prov_name)}.geojson"
         write_geojson(prov_row_df, prov_only_dir / prov_filename, precision)
 
-        prov_districts = districts_gdf.loc[districts_gdf["WADMPR"] == prov_name]
+        prov_districts = districts_detail.loc[districts_detail["WADMPR"] == prov_name]
         write_geojson(prov_districts, with_dist_dir / prov_filename, precision)
 
-    base_names = [sanitize_filename(str(v)) for v in districts_gdf["WADMKK"]]
-    name_counts = pd.Series(base_names).value_counts().to_dict()
-    for idx in range(len(districts_gdf)):
-        dist_row_df = districts_gdf.iloc[[idx]]
-        prov_name = str(dist_row_df.iloc[0]["WADMPR"])
-        base = base_names[idx]
-        if name_counts.get(base, 0) > 1:
-            filename = f"{base}__{sanitize_filename(prov_name)}.geojson"
-        else:
-            filename = f"{base}.geojson"
-        write_geojson(dist_row_df, dist_split_dir / filename, precision)
-
-    if not skip_dist:
-        dist_dir.mkdir(parents=True, exist_ok=True)
-        write_geojson(provinces_gdf, dist_dir / "indonesia_provinces.geojson", precision)
-        write_geojson(districts_gdf, dist_dir / "indonesia_districts.geojson", precision)
-        gpkg_path = dist_dir / "indonesia_admin_boundaries.gpkg"
-        if gpkg_path.exists():
-            gpkg_path.unlink()
-        provinces_gdf.to_file(gpkg_path, layer="provinces", driver="GPKG", engine="pyogrio")
-        districts_gdf.to_file(gpkg_path, layer="districts", driver="GPKG", engine="pyogrio")
+    dist_filenames = _district_filenames(districts_detail)
+    for idx, filename in enumerate(dist_filenames):
+        write_geojson(districts_detail.iloc[[idx]], dist_split_dir / filename, precision)
+    gc.collect()
 
     return {
-        "01-national": _dir_stats(nat_dir),
-        "02-provinces/province-only": _dir_stats(prov_only_dir),
-        "02-provinces/with-districts": _dir_stats(with_dist_dir),
-        "03-districts": _dir_stats(dist_split_dir),
+        "simplified/01-national": _dir_stats(simp_nat_dir),
+        "simplified/02-provinces": _dir_stats(simp_prov_dir),
+        "simplified/03-districts": _dir_stats(simp_dist_dir),
+        "high-detail/02-provinces/province-only": _dir_stats(prov_only_dir),
+        "high-detail/02-provinces/with-districts": _dir_stats(with_dist_dir),
+        "high-detail/03-districts": _dir_stats(dist_split_dir),
     }
 
 
@@ -589,26 +1086,55 @@ def main(argv: list[str] | None = None) -> int:
             dataset_path = input_path
 
         layer_name = select_layer(dataset_path, args.layer)
-        print(f"Reading layer '{layer_name}' from {dataset_path}...")
-        (
-            country_simplified,
-            provinces_simplified,
-            districts_simplified,
-            provinces_gdf,
-            districts_gdf,
-            counts,
-        ) = build_datasets(dataset_path, layer_name, args.simplify_tolerance)
+        print(f"Reading layer '{layer_name}' from {dataset_path}...", flush=True)
+        districts_full, raw_counts = load_full_districts(dataset_path, layer_name)
 
-    outputs = write_all_outputs(
+    prov_code_cols = [c for c in PROVINCE_CODE_COLS if c in districts_full.columns]
+    if not args.skip_dist:
+        write_dist_release_assets(args.dist_dir, districts_full, prov_code_cols, args.workers)
+
+    print(
+        f"Building high-detail coverage tier (tolerance={args.detail_simplify_tolerance}, workers={args.workers})...",
+        flush=True,
+    )
+    districts_detail = districts_full.copy()
+    districts_detail["geometry"] = simplify_coverage_geometries(
+        list(districts_full["geometry"]),
+        args.detail_simplify_tolerance,
+        precision=args.precision,
+        workers=args.workers,
+    )
+    del districts_full
+    gc.collect()
+
+    (
+        country_simplified,
+        provinces_simplified,
+        districts_simplified,
+        provinces_detail,
+        topology,
+    ) = build_derived_tiers(
+        districts_detail,
+        prov_code_cols,
+        args.simplify_tolerance,
+        args.precision,
+        args.workers,
+    )
+
+    counts = {
+        **raw_counts,
+        "provinces": int(len(provinces_detail)),
+        "districts": int(len(districts_detail)),
+    }
+
+    outputs = write_processed_outputs(
         output_dir=args.output_dir,
-        dist_dir=args.dist_dir,
-        skip_dist=args.skip_dist,
         precision=args.precision,
         country_simplified=country_simplified,
         provinces_simplified=provinces_simplified,
         districts_simplified=districts_simplified,
-        provinces_gdf=provinces_gdf,
-        districts_gdf=districts_gdf,
+        provinces_detail=provinces_detail,
+        districts_detail=districts_detail,
     )
 
     provenance = {
@@ -630,9 +1156,12 @@ def main(argv: list[str] | None = None) -> int:
             "crs": "EPSG:4326",
             "geometry_dimensions": 2,
             "coordinate_precision": args.precision,
-            "simplify_tolerance": args.simplify_tolerance,
+            "detail_simplify_tolerance": args.detail_simplify_tolerance,
+            "national_simplify_tolerance": args.simplify_tolerance,
+            "workers": args.workers,
         },
         "counts": counts,
+        "topology": topology,
         "outputs": outputs,
     }
 
@@ -643,9 +1172,10 @@ def main(argv: list[str] | None = None) -> int:
 
     print(
         f"Ingest complete: {counts['provinces']} provinces, {counts['districts']} districts "
-        f"(dropped null WADMKK: {counts['dropped_null_wadmkk']})."
+        f"(dropped null WADMKK: {counts['dropped_null_wadmkk']}).",
+        flush=True,
     )
-    print(f"Metadata written to {args.metadata_out}")
+    print(f"Metadata written to {args.metadata_out}", flush=True)
     return 0
 
 
