@@ -3,11 +3,10 @@
 venv/
 __pycache__/
 *.py[cod]
+.ipynb_checkpoints/
 
-# Raw BIG geospatial downloads (keep directory placeholder & docs)
-raw-data/*
-!raw-data/.gitkeep
-!raw-data/README.md
+# Local BIG geospatial download cache (created automatically by scripts/ingest.py)
+raw-data/
 
 # Raw GIS archives and datasets anywhere in the workspace
 *.gdb/
