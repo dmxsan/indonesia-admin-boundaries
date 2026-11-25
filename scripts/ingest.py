@@ -147,7 +147,7 @@ def download_file(url: str, dest_dir: Path, fallback_name: str, force: bool = Fa
                 if url_name and url_name != "download":
                     filename = url_name
     except Exception:
-        pass
+        filename = None
 
     if filename:
         dest_path = dest_dir / filename
@@ -805,13 +805,12 @@ def _write_provinces_only_zip(zip_path: Path, provinces_full: gpd.GeoDataFrame) 
 
 def _write_provinces_with_districts_zip(
     zip_path: Path,
-    provinces_full: gpd.GeoDataFrame,
+    prov_names: list[str],
     districts_full: gpd.GeoDataFrame,
     prov_to_dist_indices: dict[str, list[int]],
 ) -> Path:
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
-        for idx in range(len(provinces_full)):
-            prov_name = str(provinces_full.iloc[idx]["WADMPR"])
+        for prov_name in prov_names:
             arcname = f"02-provinces/with-districts/{sanitize_filename(prov_name)}.geojson"
             prov_districts = districts_full.iloc[prov_to_dist_indices[prov_name]]
             with zf.open(arcname, "w", force_zip64=True) as entry_fp:
@@ -872,9 +871,20 @@ def write_dist_release_assets(
     tmp_gpkg = dist_dir / "_tmp_indonesia_admin_boundaries.gpkg"
     gpkg_zip_path = dist_dir / "official_all-levels_indonesia.gpkg.zip"
     asset_paths: list[Path] = []
+
+    def _run_batch(batch: list[tuple[Any, tuple[Any, ...]]], max_threads: int) -> None:
+        if workers > 1 and len(batch) > 1:
+            with ThreadPoolExecutor(max_workers=min(workers, max_threads, len(batch))) as ex:
+                futures = [ex.submit(fn, *fn_args) for fn, fn_args in batch]
+                for fut in futures:
+                    asset_paths.append(fut.result())
+        else:
+            for fn, fn_args in batch:
+                asset_paths.append(fn(*fn_args))
+
     try:
         country_full.to_file(tmp_gpkg, layer="country", driver="GPKG", engine="pyogrio")
-        # Write the massive single-feature country GeoJSON solo so its transient buffer never overlaps worker threads.
+        # Write and free full-resolution tiers stage-by-stage so country/province heaps don't stack during district zips.
         asset_paths.append(
             _write_gz_release_asset(dist_dir / "official_01-national_indonesia_merged.geojson.gz", country_full)
         )
@@ -882,37 +892,40 @@ def write_dist_release_assets(
         gc.collect()
 
         provinces_full.to_file(tmp_gpkg, layer="provinces", driver="GPKG", engine="pyogrio")
+        prov_names = [str(p) for p in provinces_full["WADMPR"].tolist()]
+        _run_batch(
+            [
+                (_write_gz_release_asset, (dist_dir / "official_02-provinces_merged.geojson.gz", provinces_full)),
+                (_write_provinces_only_zip, (dist_dir / "official_02-provinces_split-by-province.zip", provinces_full)),
+            ],
+            max_threads=2,
+        )
+        del provinces_full
+        gc.collect()
+
         districts_full.to_file(tmp_gpkg, layer="districts", driver="GPKG", engine="pyogrio")
+        asset_paths.append(_zip_gpkg(tmp_gpkg, gpkg_zip_path))
 
         prov_to_dist_indices: dict[str, list[int]] = {}
         for pos, prov_val in enumerate(districts_full["WADMPR"].tolist()):
             prov_to_dist_indices.setdefault(str(prov_val), []).append(pos)
 
-        tasks = [
-            (_zip_gpkg, (tmp_gpkg, gpkg_zip_path)),
-            (_write_gz_release_asset, (dist_dir / "official_02-provinces_merged.geojson.gz", provinces_full)),
-            (_write_gz_release_asset, (dist_dir / "official_03-districts_merged.geojson.gz", districts_full)),
-            (_write_provinces_only_zip, (dist_dir / "official_02-provinces_split-by-province.zip", provinces_full)),
-            (
-                _write_provinces_with_districts_zip,
+        _run_batch(
+            [
+                (_write_gz_release_asset, (dist_dir / "official_03-districts_merged.geojson.gz", districts_full)),
                 (
-                    dist_dir / "official_02-provinces_split-with-districts.zip",
-                    provinces_full,
-                    districts_full,
-                    prov_to_dist_indices,
+                    _write_provinces_with_districts_zip,
+                    (
+                        dist_dir / "official_02-provinces_split-with-districts.zip",
+                        prov_names,
+                        districts_full,
+                        prov_to_dist_indices,
+                    ),
                 ),
-            ),
-            (_write_districts_zip, (dist_dir / "official_03-districts_split-by-district.zip", districts_full)),
-        ]
-
-        if workers > 1:
-            with ThreadPoolExecutor(max_workers=min(workers, 3)) as ex:
-                futures = [ex.submit(fn, *fn_args) for fn, fn_args in tasks]
-                for fut in futures:
-                    asset_paths.append(fut.result())
-        else:
-            for fn, fn_args in tasks:
-                asset_paths.append(fn(*fn_args))
+                (_write_districts_zip, (dist_dir / "official_03-districts_split-by-district.zip", districts_full)),
+            ],
+            max_threads=2,
+        )
     finally:
         if tmp_gpkg.exists():
             tmp_gpkg.unlink()
@@ -922,8 +935,6 @@ def write_dist_release_assets(
         for p in sorted(asset_paths, key=lambda x: x.name)
     ]
     (dist_dir / "SHA256SUMS.txt").write_text("".join(checksum_lines), encoding="utf-8")
-
-    del provinces_full
     gc.collect()
 
 
