@@ -1,0 +1,86 @@
+{
+  "source": {
+    "provider": "Badan Informasi Geospasial (BIG)",
+    "portal_urls": [
+      "https://tanahair.indonesia.go.id/",
+      "https://geoportal.big.go.id/"
+    ],
+    "download_url": "https://drive.big.go.id/s/9x9dJWSNfQ3wp7S/download",
+    "archive_name": "BATASWILAYAH_KABKOTA_20260601.gdb.zip",
+    "archive_sha256": "80406e4d8e527149815f8c7c1533866b001cbc169337e33817f272626afa0c2d",
+    "layer": "BATAS_KABKOTA_AR",
+    "metadata_id": "TASWIL5000020260612KABKOTA",
+    "title": "BATAS_KABKOTA_AR_2026",
+    "edition": "Edisi Tahun 2026 Semester 1",
+    "edition_date": "2026-06-12",
+    "disclaimer": "Data batas yang berstatus indikatif tidak dapat dijadikan referensi hukum."
+  },
+  "processing": {
+    "generated_at_utc": "2026-11-25T13:12:55+00:00",
+    "crs": "EPSG:4326",
+    "geometry_dimensions": 2,
+    "coordinate_precision": 6,
+    "detail_simplify_tolerance": 2e-05,
+    "national_simplify_tolerance": 0.001,
+    "workers": 4
+  },
+  "counts": {
+    "raw_features": 541,
+    "dropped_empty_geometries": 0,
+    "dropped_null_wadmpr": 0,
+    "dropped_null_wadmkk": 21,
+    "dropped_null_wadmkk_by_province": {
+      "Jawa Timur": 3,
+      "Kalimantan Timur": 1,
+      "Kepulauan Riau": 1,
+      "Maluku": 6,
+      "Maluku Utara": 4,
+      "Sulawesi Selatan": 1,
+      "Sulawesi Utara": 1,
+      "Sumatera Barat": 3,
+      "Sumatera Utara": 1
+    },
+    "provinces": 38,
+    "districts": 514
+  },
+  "topology": {
+    "method": "coverage_clean + coverage_simplify + coverage_union_all",
+    "districts_detail_coverage_valid": true,
+    "provinces_detail_coverage_valid": true,
+    "districts_simplified_coverage_valid": true,
+    "provinces_simplified_coverage_valid": true,
+    "country_interior_holes": 13,
+    "province_interior_holes_total": 13,
+    "province_interior_holes_by_province": {
+      "Nusa Tenggara Barat": 1,
+      "Sulawesi Tenggara": 11,
+      "Sulawesi Utara": 1
+    }
+  },
+  "outputs": {
+    "simplified/01-national": {
+      "file_count": 1,
+      "max_file_bytes": 6519560
+    },
+    "simplified/02-provinces": {
+      "file_count": 1,
+      "max_file_bytes": 7736676
+    },
+    "simplified/03-districts": {
+      "file_count": 1,
+      "max_file_bytes": 12720620
+    },
+    "high-detail/02-provinces/province-only": {
+      "file_count": 38,
+      "max_file_bytes": 13288189
+    },
+    "high-detail/02-provinces/with-districts": {
+      "file_count": 38,
+      "max_file_bytes": 14090852
+    },
+    "high-detail/03-districts": {
+      "file_count": 514,
+      "max_file_bytes": 9140827
+    }
+  }
+}
