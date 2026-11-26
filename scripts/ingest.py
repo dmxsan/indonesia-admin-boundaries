@@ -85,6 +85,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=Path("metadata/source.json"),
         help="Path for provenance metadata JSON output.",
     )
+    parser.add_argument(
+        "--catalog-out",
+        type=Path,
+        default=Path("metadata/catalog.json"),
+        help="Path for machine-readable catalog manifest JSON output.",
+    )
+    parser.add_argument(
+        "--build-catalog-only",
+        action="store_true",
+        help="Build --catalog-out from existing --output-dir and --metadata-out without raw-data ingestion.",
+    )
     parser.add_argument("--precision", type=int, default=6, help="GeoJSON coordinate decimal places.")
     parser.add_argument(
         "--detail-simplify-tolerance",
@@ -107,8 +118,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--edition", default=None, help="Optional edition label override.")
 
     args = parser.parse_args(argv)
-    if args.input is None and not args.download:
+    if not args.build_catalog_only and args.input is None and not args.download:
         parser.error("Provide --input PATH or --download.")
+    if args.build_catalog_only and args.edition is not None:
+        parser.error("--edition cannot be combined with --build-catalog-only.")
     if args.precision < 0:
         parser.error("--precision must be >= 0.")
     if args.detail_simplify_tolerance < 0:
@@ -1061,8 +1074,163 @@ def write_processed_outputs(
     }
 
 
+def _derive_catalog_version(edition_date: str | None) -> str:
+    if isinstance(edition_date, str):
+        stripped = edition_date.strip()
+        if len(stripped) >= 7 and re.match(r"^\d{4}-\d{2}", stripped):
+            return f"v{stripped[:7].replace('-', '.')}"
+    return "v0.0"
+
+
+def _round_bbox(geom: Any, precision: int) -> list[float]:
+    minx, miny, maxx, maxy = geom.bounds
+    return [round(float(val), precision) + 0.0 for val in (minx, miny, maxx, maxy)]
+
+
+def build_catalog(
+    provinces_detail: gpd.GeoDataFrame,
+    districts_detail: gpd.GeoDataFrame,
+    source_meta: dict[str, Any],
+    version: str | None = None,
+    precision: int = 6,
+    output_dir: Path = Path("processed-data"),
+) -> dict[str, Any]:
+    """Build machine-readable catalog dictionary from processed province and district GeoDataFrames."""
+    source_info = source_meta.get("source") if isinstance(source_meta.get("source"), dict) else source_meta
+    edition = source_info.get("edition")
+    edition_date = source_info.get("edition_date")
+    resolved_version = version or _derive_catalog_version(edition_date)
+    out_prefix = output_dir.as_posix().rstrip("/")
+
+    provinces_sorted = provinces_detail.sort_values(["WADMPR"]).reset_index(drop=True)
+    districts_sorted = districts_detail.sort_values(["WADMPR", "WADMKK"]).reset_index(drop=True)
+    dist_counts_map = districts_sorted["WADMPR"].astype(str).value_counts().to_dict()
+
+    provinces_entries: list[dict[str, Any]] = []
+    for _, row in provinces_sorted.iterrows():
+        prov_name = str(row["WADMPR"])
+        prov_filename = f"{sanitize_filename(prov_name)}.geojson"
+        provinces_entries.append(
+            {
+                "WADMPR": prov_name,
+                "KDPPUM": _json_scalar(row["KDPPUM"]) if "KDPPUM" in provinces_sorted.columns else None,
+                "KDPBPS": _json_scalar(row["KDPBPS"]) if "KDPBPS" in provinces_sorted.columns else None,
+                "district_count": int(dist_counts_map.get(prov_name, 0)),
+                "bbox": _round_bbox(row["geometry"], precision),
+                "province_only_path": f"{out_prefix}/high-detail/02-provinces/province-only/{prov_filename}",
+                "with_districts_path": f"{out_prefix}/high-detail/02-provinces/with-districts/{prov_filename}",
+                "official_province_only_member": f"02-provinces/province-only/{prov_filename}",
+                "official_with_districts_member": f"02-provinces/with-districts/{prov_filename}",
+            }
+        )
+
+    dist_filenames = _district_filenames(districts_sorted)
+    districts_entries: list[dict[str, Any]] = []
+    for idx, dist_filename in enumerate(dist_filenames):
+        row = districts_sorted.iloc[idx]
+        districts_entries.append(
+            {
+                "WADMPR": str(row["WADMPR"]),
+                "WADMKK": str(row["WADMKK"]),
+                "KDPPUM": _json_scalar(row["KDPPUM"]) if "KDPPUM" in districts_sorted.columns else None,
+                "KDPKAB": _json_scalar(row["KDPKAB"]) if "KDPKAB" in districts_sorted.columns else None,
+                "KDPBPS": _json_scalar(row["KDPBPS"]) if "KDPBPS" in districts_sorted.columns else None,
+                "KDBBPS": _json_scalar(row["KDBBPS"]) if "KDBBPS" in districts_sorted.columns else None,
+                "bbox": _round_bbox(row["geometry"], precision),
+                "high_detail_path": f"{out_prefix}/high-detail/03-districts/{dist_filename}",
+                "official_zip_member": f"03-districts/{dist_filename}",
+            }
+        )
+
+    return {
+        "version": resolved_version,
+        "edition": edition,
+        "edition_date": edition_date,
+        "crs": "EPSG:4326",
+        "simplified": {
+            "country": f"{out_prefix}/simplified/01-national/indonesia.geojson",
+            "provinces": f"{out_prefix}/simplified/02-provinces/indonesia_provinces.geojson",
+            "districts": f"{out_prefix}/simplified/03-districts/indonesia_districts.geojson",
+        },
+        "provinces": provinces_entries,
+        "districts": districts_entries,
+    }
+
+
+def write_catalog(catalog: dict[str, Any], path: Path) -> None:
+    """Write catalog manifest as UTF-8 LF-terminated JSON."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(catalog, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+
+def _load_single_feature_dir(directory: Path) -> gpd.GeoDataFrame:
+    files = sorted(directory.glob("*.geojson"))
+    if not files:
+        raise FileNotFoundError(f"No GeoJSON files found in {directory}")
+    rows: list[dict[str, Any]] = []
+    for path in files:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        features = data.get("features")
+        if not isinstance(features, list) or len(features) != 1:
+            raise ValueError(f"Expected 1 feature in {path}, found {len(features) if isinstance(features, list) else 0}.")
+        feat = features[0]
+        props = dict(feat.get("properties") or {})
+        props["geometry"] = shapely.geometry.shape(feat["geometry"])
+        rows.append(props)
+    return gpd.GeoDataFrame(rows, geometry="geometry", crs="EPSG:4326")
+
+
+def build_catalog_from_processed(args: argparse.Namespace) -> int:
+    """Generate catalog JSON directly from existing processed-data/ and metadata/source.json."""
+    if not args.metadata_out.is_file():
+        raise FileNotFoundError(f"Metadata file does not exist: {args.metadata_out}")
+
+    simplified_paths = (
+        args.output_dir / "simplified" / "01-national" / "indonesia.geojson",
+        args.output_dir / "simplified" / "02-provinces" / "indonesia_provinces.geojson",
+        args.output_dir / "simplified" / "03-districts" / "indonesia_districts.geojson",
+    )
+    for simp_path in simplified_paths:
+        if not simp_path.is_file():
+            raise FileNotFoundError(f"Required simplified GeoJSON missing: {simp_path}")
+
+    prov_only_dir = args.output_dir / "high-detail" / "02-provinces" / "province-only"
+    with_dist_dir = args.output_dir / "high-detail" / "02-provinces" / "with-districts"
+    dist_split_dir = args.output_dir / "high-detail" / "03-districts"
+    for d in (prov_only_dir, with_dist_dir, dist_split_dir):
+        if not d.is_dir():
+            raise FileNotFoundError(f"Required processed directory missing: {d}")
+
+    meta = json.loads(args.metadata_out.read_text(encoding="utf-8"))
+    source_info = dict(meta.get("source") if isinstance(meta.get("source"), dict) else meta)
+
+    provinces_detail = _load_single_feature_dir(prov_only_dir)
+    districts_detail = _load_single_feature_dir(dist_split_dir)
+
+    version = _derive_catalog_version(source_info.get("edition_date"))
+    catalog = build_catalog(
+        provinces_detail=provinces_detail,
+        districts_detail=districts_detail,
+        source_meta=source_info,
+        version=version,
+        precision=args.precision,
+        output_dir=args.output_dir,
+    )
+    write_catalog(catalog, args.catalog_out)
+    print(
+        f"Catalog written to {args.catalog_out}: "
+        f"{len(catalog['provinces'])} provinces, {len(catalog['districts'])} districts.",
+        flush=True,
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.build_catalog_only:
+        return build_catalog_from_processed(args)
 
     input_path = args.input
     metadata_xml_path = args.metadata_xml
@@ -1181,12 +1349,24 @@ def main(argv: list[str] | None = None) -> int:
         json.dump(provenance, f, indent=2, ensure_ascii=False)
         f.write("\n")
 
+    version = _derive_catalog_version(provenance["source"].get("edition_date"))
+    catalog = build_catalog(
+        provinces_detail=provinces_detail,
+        districts_detail=districts_detail,
+        source_meta=provenance["source"],
+        version=version,
+        precision=args.precision,
+        output_dir=args.output_dir,
+    )
+    write_catalog(catalog, args.catalog_out)
+
     print(
         f"Ingest complete: {counts['provinces']} provinces, {counts['districts']} districts "
         f"(dropped null WADMKK: {counts['dropped_null_wadmkk']}).",
         flush=True,
     )
     print(f"Metadata written to {args.metadata_out}", flush=True)
+    print(f"Catalog written to {args.catalog_out}", flush=True)
     return 0
 
 

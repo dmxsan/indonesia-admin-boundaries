@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--no-metadata", action="store_true", help="Skip metadata/source.json cross-check.")
     parser.add_argument(
+        "--catalog",
+        type=Path,
+        default=None,
+        help="Catalog manifest JSON path (defaults to metadata/catalog.json unless --no-metadata or --no-catalog is set).",
+    )
+    parser.add_argument("--no-catalog", action="store_true", help="Skip metadata/catalog.json validation.")
+    parser.add_argument(
         "--expected-provinces",
         type=int,
         default=38,
@@ -52,7 +60,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=45.0,
         help="Maximum allowed GeoJSON file size in decimal MB (1,000,000 bytes).",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.no_catalog and args.catalog is not None:
+        parser.error("--catalog cannot be combined with --no-catalog.")
+    return args
 
 
 def _check_coords_2d_wgs84(coords: Any, path_label: str, errors: list[str]) -> bool:
@@ -177,6 +188,306 @@ def validate_geojson_file(
     return features, valid_geoms, size
 
 
+def _resolve_catalog_path(
+    raw_path: Any,
+    data_dir: Path,
+    expected_parent: Path,
+    label: str,
+    errors: list[str],
+) -> Path | None:
+    if not _non_empty_str(raw_path):
+        errors.append(f"{label}: missing/empty path.")
+        return None
+    raw_str = str(raw_path)
+    candidates: list[Path] = []
+    if data_dir != Path("processed-data") and raw_str.startswith("processed-data/"):
+        candidates.append(data_dir / raw_str.removeprefix("processed-data/"))
+    candidates.append(Path(raw_str))
+    resolved = next((cand for cand in candidates if cand.is_file()), None)
+    if resolved is None:
+        errors.append(f"{label}: referenced file does not exist ({raw_str}).")
+        return None
+    if resolved.resolve().parent != expected_parent.resolve():
+        errors.append(f"{label}: path {raw_str} is outside expected directory {expected_parent}.")
+        return None
+    return resolved
+
+
+def _validate_wgs84_bbox(bbox: Any, label: str, errors: list[str]) -> None:
+    if not isinstance(bbox, list) or len(bbox) != 4:
+        errors.append(f"{label}: bbox must be a 4-element list, got {bbox!r}.")
+        return
+    nums: list[float] = []
+    for coord in bbox:
+        if not isinstance(coord, (int, float)) or isinstance(coord, bool) or not math.isfinite(float(coord)):
+            errors.append(f"{label}: bbox contains invalid coordinate {coord!r}.")
+            return
+        nums.append(float(coord))
+    minx, miny, maxx, maxy = nums
+    if not (-180.0 <= minx <= maxx <= 180.0 and -90.0 <= miny <= maxy <= 90.0):
+        errors.append(f"{label}: bbox out of WGS84 bounds or inverted: {bbox!r}.")
+
+
+def _validate_catalog_provinces(
+    provinces: Any,
+    data_dir: Path,
+    prov_count: int,
+    expected_provinces: int,
+    prov_only_props: dict[str, dict[str, Any]],
+    prov_only_bboxes: dict[str, list[float]],
+    with_dist_props: dict[str, list[dict[str, Any]]],
+    errors: list[str],
+) -> tuple[dict[str, int], int]:
+    prov_district_counts: dict[str, int] = {}
+    sum_district_count = 0
+    if not isinstance(provinces, list):
+        errors.append("Catalog 'provinces' must be a list.")
+        return prov_district_counts, sum_district_count
+
+    if len(provinces) != prov_count:
+        errors.append(f"Catalog provinces length={len(provinces)} does not match {prov_count}.")
+    if expected_provinces > 0 and len(provinces) != expected_provinces:
+        errors.append(f"Catalog provinces length={len(provinces)} does not match expected {expected_provinces}.")
+
+    prov_only_dir = data_dir / "high-detail" / "02-provinces" / "province-only"
+    with_dist_dir = data_dir / "high-detail" / "02-provinces" / "with-districts"
+    seen_names: set[str] = set()
+    seen_files: set[str] = set()
+
+    for idx, entry in enumerate(provinces):
+        label = f"Catalog provinces[{idx}]"
+        if not isinstance(entry, dict):
+            errors.append(f"{label}: entry must be an object.")
+            continue
+        wadmpr = entry.get("WADMPR")
+        if not _non_empty_str(wadmpr):
+            errors.append(f"{label}: missing/empty WADMPR.")
+            continue
+        label = f"Catalog provinces[{idx}] ({wadmpr})"
+        if wadmpr in seen_names:
+            errors.append(f"{label}: duplicate WADMPR entry.")
+        seen_names.add(wadmpr)
+
+        for key in ("KDPPUM", "KDPBPS"):
+            if key not in entry:
+                errors.append(f"{label}: missing required key '{key}'.")
+
+        dc = entry.get("district_count")
+        if not isinstance(dc, int) or isinstance(dc, bool) or dc < 1:
+            errors.append(f"{label}: district_count must be a positive int, got {dc!r}.")
+        else:
+            sum_district_count += dc
+            prov_district_counts[wadmpr] = dc
+
+        _validate_wgs84_bbox(entry.get("bbox"), label, errors)
+
+        po_resolved = _resolve_catalog_path(
+            entry.get("province_only_path"), data_dir, prov_only_dir, f"{label} province_only_path", errors
+        )
+        wd_resolved = _resolve_catalog_path(
+            entry.get("with_districts_path"), data_dir, with_dist_dir, f"{label} with_districts_path", errors
+        )
+        if po_resolved is not None:
+            if po_resolved.name in seen_files:
+                errors.append(f"{label}: duplicate province_only_path file {po_resolved.name}.")
+            seen_files.add(po_resolved.name)
+            expected_po_member = f"02-provinces/province-only/{po_resolved.name}"
+            if entry.get("official_province_only_member") != expected_po_member:
+                errors.append(
+                    f"{label}: official_province_only_member={entry.get('official_province_only_member')!r} "
+                    f"does not match {expected_po_member!r}."
+                )
+            geo_props = prov_only_props.get(po_resolved.name)
+            if geo_props is not None:
+                for attr in ("WADMPR", "KDPPUM", "KDPBPS"):
+                    if entry.get(attr) != geo_props.get(attr):
+                        errors.append(
+                            f"{label}: {attr}={entry.get(attr)!r} does not match {po_resolved.name} ({geo_props.get(attr)!r})."
+                        )
+            actual_bbox = prov_only_bboxes.get(po_resolved.name)
+            if actual_bbox is not None and entry.get("bbox") != actual_bbox:
+                errors.append(f"{label}: bbox={entry.get('bbox')!r} does not match {po_resolved.name} ({actual_bbox!r}).")
+        if wd_resolved is not None:
+            expected_wd_member = f"02-provinces/with-districts/{wd_resolved.name}"
+            if entry.get("official_with_districts_member") != expected_wd_member:
+                errors.append(
+                    f"{label}: official_with_districts_member={entry.get('official_with_districts_member')!r} "
+                    f"does not match {expected_wd_member!r}."
+                )
+            wd_feats = with_dist_props.get(wd_resolved.name)
+            if wd_feats is not None:
+                if isinstance(dc, int) and not isinstance(dc, bool) and len(wd_feats) != dc:
+                    errors.append(
+                        f"{label}: district_count={dc} does not match {wd_resolved.name} feature count ({len(wd_feats)})."
+                    )
+                if any(feat.get("WADMPR") != wadmpr for feat in wd_feats):
+                    errors.append(f"{label}: {wd_resolved.name} contains mismatched WADMPR properties.")
+        if po_resolved is not None and wd_resolved is not None and po_resolved.stem != wd_resolved.stem:
+            errors.append(
+                f"{label}: province_only_path stem '{po_resolved.stem}' != with_districts_path stem '{wd_resolved.stem}'."
+            )
+
+    return prov_district_counts, sum_district_count
+
+
+def _validate_catalog_districts(
+    districts: Any,
+    data_dir: Path,
+    dist_count: int,
+    expected_districts: int,
+    dist_props: dict[str, dict[str, Any]],
+    dist_bboxes: dict[str, list[float]],
+    prov_district_counts: dict[str, int],
+    errors: list[str],
+) -> None:
+    if not isinstance(districts, list):
+        errors.append("Catalog 'districts' must be a list.")
+        return
+
+    if len(districts) != dist_count:
+        errors.append(f"Catalog districts length={len(districts)} does not match {dist_count}.")
+    if expected_districts > 0 and len(districts) != expected_districts:
+        errors.append(f"Catalog districts length={len(districts)} does not match expected {expected_districts}.")
+
+    dist_dir = data_dir / "high-detail" / "03-districts"
+    seen_keys: set[tuple[str, str]] = set()
+    seen_files: set[str] = set()
+    dist_count_by_prov: dict[str, int] = {}
+
+    for idx, entry in enumerate(districts):
+        label = f"Catalog districts[{idx}]"
+        if not isinstance(entry, dict):
+            errors.append(f"{label}: entry must be an object.")
+            continue
+        wadmpr = entry.get("WADMPR")
+        wadmkk = entry.get("WADMKK")
+        if not _non_empty_str(wadmpr) or not _non_empty_str(wadmkk):
+            errors.append(f"{label}: missing/empty WADMPR or WADMKK.")
+            continue
+        label = f"Catalog districts[{idx}] ({wadmpr}/{wadmkk})"
+        key = (wadmpr, wadmkk)
+        if key in seen_keys:
+            errors.append(f"{label}: duplicate (WADMPR, WADMKK) entry.")
+        seen_keys.add(key)
+        dist_count_by_prov[wadmpr] = dist_count_by_prov.get(wadmpr, 0) + 1
+
+        for col in ("KDPPUM", "KDPKAB", "KDPBPS", "KDBBPS"):
+            if col not in entry:
+                errors.append(f"{label}: missing required key '{col}'.")
+
+        _validate_wgs84_bbox(entry.get("bbox"), label, errors)
+
+        dist_resolved = _resolve_catalog_path(
+            entry.get("high_detail_path"), data_dir, dist_dir, f"{label} high_detail_path", errors
+        )
+        if dist_resolved is not None:
+            if dist_resolved.name in seen_files:
+                errors.append(f"{label}: duplicate high_detail_path file {dist_resolved.name}.")
+            seen_files.add(dist_resolved.name)
+            expected_member = f"03-districts/{dist_resolved.name}"
+            if entry.get("official_zip_member") != expected_member:
+                errors.append(
+                    f"{label}: official_zip_member={entry.get('official_zip_member')!r} "
+                    f"does not match {expected_member!r}."
+                )
+            geo_props = dist_props.get(dist_resolved.name)
+            if geo_props is not None:
+                for attr in ("WADMPR", "WADMKK", "KDPPUM", "KDPKAB", "KDPBPS", "KDBBPS"):
+                    if entry.get(attr) != geo_props.get(attr):
+                        errors.append(
+                            f"{label}: {attr}={entry.get(attr)!r} does not match {dist_resolved.name} ({geo_props.get(attr)!r})."
+                        )
+            actual_bbox = dist_bboxes.get(dist_resolved.name)
+            if actual_bbox is not None and entry.get("bbox") != actual_bbox:
+                errors.append(f"{label}: bbox={entry.get('bbox')!r} does not match {dist_resolved.name} ({actual_bbox!r}).")
+
+    if prov_district_counts and dist_count_by_prov != prov_district_counts:
+        errors.append("Catalog per-province district counts in 'districts' do not match 'provinces[*].district_count'.")
+
+
+def validate_catalog(
+    catalog_path: Path,
+    data_dir: Path,
+    prov_count: int,
+    dist_count: int,
+    expected_provinces: int,
+    expected_districts: int,
+    prov_only_props: dict[str, dict[str, Any]],
+    prov_only_bboxes: dict[str, list[float]],
+    with_dist_props: dict[str, list[dict[str, Any]]],
+    dist_props: dict[str, dict[str, Any]],
+    dist_bboxes: dict[str, list[float]],
+    meta: dict[str, Any] | None,
+    errors: list[str],
+) -> None:
+    """Validate metadata/catalog.json schema, paths, bboxes, counts, and attribute parity."""
+    if not catalog_path.is_file():
+        errors.append(f"Missing catalog manifest file: {catalog_path}")
+        return
+
+    try:
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        errors.append(f"Failed to parse catalog file {catalog_path}: {exc}")
+        return
+
+    if not isinstance(catalog, dict):
+        errors.append(f"Catalog file {catalog_path}: top-level JSON must be an object.")
+        return
+
+    if not _non_empty_str(catalog.get("version")):
+        errors.append(f"Catalog {catalog_path}: missing/empty 'version'.")
+    if catalog.get("crs") != "EPSG:4326":
+        errors.append(f"Catalog {catalog_path}: expected crs='EPSG:4326', got {catalog.get('crs')!r}.")
+    for top_key in ("edition", "edition_date"):
+        if top_key not in catalog:
+            errors.append(f"Catalog {catalog_path}: missing '{top_key}' key.")
+
+    if isinstance(meta, dict) and isinstance(meta.get("source"), dict):
+        src = meta["source"]
+        if src.get("edition") is not None and catalog.get("edition") != src.get("edition"):
+            errors.append(f"Catalog edition={catalog.get('edition')!r} != metadata source.edition={src.get('edition')!r}.")
+        if src.get("edition_date") is not None and catalog.get("edition_date") != src.get("edition_date"):
+            errors.append(
+                f"Catalog edition_date={catalog.get('edition_date')!r} != metadata source.edition_date={src.get('edition_date')!r}."
+            )
+
+    simplified = catalog.get("simplified")
+    if not isinstance(simplified, dict):
+        errors.append(f"Catalog {catalog_path}: 'simplified' must be an object.")
+    else:
+        for key, (rel_dir, filename) in SIMPLIFIED_FILES.items():
+            resolved = _resolve_catalog_path(
+                simplified.get(key), data_dir, data_dir / rel_dir, f"Catalog simplified.{key}", errors
+            )
+            if resolved is not None and resolved.name != filename:
+                errors.append(f"Catalog simplified.{key}: expected filename {filename}, got {resolved.name}.")
+
+    prov_district_counts, sum_district_count = _validate_catalog_provinces(
+        catalog.get("provinces"),
+        data_dir,
+        prov_count,
+        expected_provinces,
+        prov_only_props,
+        prov_only_bboxes,
+        with_dist_props,
+        errors,
+    )
+    if sum_district_count != dist_count:
+        errors.append(f"Catalog sum(provinces[*].district_count)={sum_district_count} does not match {dist_count}.")
+
+    _validate_catalog_districts(
+        catalog.get("districts"),
+        data_dir,
+        dist_count,
+        expected_districts,
+        dist_props,
+        dist_bboxes,
+        prov_district_counts,
+        errors,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     data_dir = args.data_dir
@@ -266,6 +577,8 @@ def main(argv: list[str] | None = None) -> int:
 
     prov_only_geoms: list[Any] = []
     prov_only_labels: list[str] = []
+    prov_only_props: dict[str, dict[str, Any]] = {}
+    prov_only_bboxes: dict[str, list[float]] = {}
     prov_holes_total = 0
     for path in prov_only_files:
         features, geoms, size = validate_geojson_file(
@@ -278,18 +591,23 @@ def main(argv: list[str] | None = None) -> int:
                 f"high-detail/02-provinces/province-only/{path.name}: expected 1 feature, found {len(features)}."
             )
         else:
-            pr = features[0].get("properties", {}).get("WADMPR")
+            props = features[0].get("properties", {})
+            if isinstance(props, dict):
+                prov_only_props[path.name] = props
+            pr = props.get("WADMPR") if isinstance(props, dict) else None
             if not _non_empty_str(pr):
                 errors.append(f"high-detail/02-provinces/province-only/{path.name}: missing/empty WADMPR.")
             if len(geoms) == 1:
                 prov_only_geoms.append(geoms[0])
                 prov_only_labels.append(f"{path.name} ({pr})")
+                prov_only_bboxes[path.name] = [round(float(v), 6) + 0.0 for v in geoms[0].bounds]
                 prov_holes_total += count_interior_holes(geoms[0])
 
     if len(prov_only_geoms) == len(prov_only_files):
         check_coverage(prov_only_geoms, prov_only_labels, "high-detail/02-provinces/province-only (all)", errors)
 
     total_with_dist_features = 0
+    with_dist_props: dict[str, list[dict[str, Any]]] = {}
     for path in with_dist_files:
         features, geoms, size = validate_geojson_file(
             path, f"high-detail/02-provinces/with-districts/{path.name}", max_bytes, errors
@@ -297,6 +615,10 @@ def main(argv: list[str] | None = None) -> int:
         max_seen_bytes = max(max_seen_bytes, size)
         files_checked += 1
         total_with_dist_features += len(features)
+        with_dist_props[path.name] = [
+            feat.get("properties", {}) if isinstance(feat.get("properties"), dict) else {}
+            for feat in features
+        ]
         labels = []
         for i, feat in enumerate(features):
             props = feat.get("properties", {})
@@ -313,6 +635,8 @@ def main(argv: list[str] | None = None) -> int:
     dist_files = sorted(dist_dir.glob("*.geojson"))
     dist_geoms: list[Any] = []
     dist_labels: list[str] = []
+    dist_props: dict[str, dict[str, Any]] = {}
+    dist_bboxes: dict[str, list[float]] = {}
     for path in dist_files:
         features, geoms, size = validate_geojson_file(path, f"high-detail/03-districts/{path.name}", max_bytes, errors)
         max_seen_bytes = max(max_seen_bytes, size)
@@ -321,12 +645,15 @@ def main(argv: list[str] | None = None) -> int:
             errors.append(f"high-detail/03-districts/{path.name}: expected 1 feature, found {len(features)}.")
         else:
             props = features[0].get("properties", {})
-            pr, kk = props.get("WADMPR"), props.get("WADMKK")
+            if isinstance(props, dict):
+                dist_props[path.name] = props
+            pr, kk = (props.get("WADMPR"), props.get("WADMKK")) if isinstance(props, dict) else (None, None)
             if not _non_empty_str(pr) or not _non_empty_str(kk):
                 errors.append(f"high-detail/03-districts/{path.name}: missing/empty WADMPR or WADMKK.")
             if len(geoms) == 1:
                 dist_geoms.append(geoms[0])
                 dist_labels.append(f"{path.name} ({pr}/{kk})")
+                dist_bboxes[path.name] = [round(float(v), 6) + 0.0 for v in geoms[0].bounds]
 
     if len(dist_geoms) == len(dist_files):
         check_coverage(dist_geoms, dist_labels, "high-detail/03-districts (all)", errors)
@@ -356,6 +683,7 @@ def main(argv: list[str] | None = None) -> int:
         errors.append(f"Expected {args.expected_districts} districts, found {dist_count}.")
 
     # 5. Provenance metadata & topology parity check
+    meta: dict[str, Any] | None = None
     if not args.no_metadata:
         if not args.metadata.is_file():
             errors.append(f"Missing provenance metadata file: {args.metadata}")
@@ -393,6 +721,33 @@ def main(argv: list[str] | None = None) -> int:
                             errors.append(f"Metadata topology.{bool_key} is {topo.get(bool_key)!r}, expected True.")
             except Exception as exc:
                 errors.append(f"Failed to parse metadata file {args.metadata}: {exc}")
+
+    # 6. Catalog manifest parity check
+    if args.no_catalog:
+        catalog_path = None
+    elif args.catalog is not None:
+        catalog_path = args.catalog
+    elif not args.no_metadata:
+        catalog_path = args.metadata.parent / "catalog.json"
+    else:
+        catalog_path = None
+
+    if catalog_path is not None:
+        validate_catalog(
+            catalog_path=catalog_path,
+            data_dir=data_dir,
+            prov_count=prov_count,
+            dist_count=dist_count,
+            expected_provinces=args.expected_provinces,
+            expected_districts=args.expected_districts,
+            prov_only_props=prov_only_props,
+            prov_only_bboxes=prov_only_bboxes,
+            with_dist_props=with_dist_props,
+            dist_props=dist_props,
+            dist_bboxes=dist_bboxes,
+            meta=meta,
+            errors=errors,
+        )
 
     print(
         f"Validation checked {files_checked} GeoJSON files: "

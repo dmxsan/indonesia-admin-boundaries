@@ -7,12 +7,20 @@ on:
       - "processed-data/**"
       - "metadata/**"
       - "scripts/**"
+      - "tests/**"
+      - "README.md"
+      - "README.id.md"
+      - "CITATION.cff"
       - ".github/workflows/validate.yml"
   pull_request:
     paths:
       - "processed-data/**"
       - "metadata/**"
       - "scripts/**"
+      - "tests/**"
+      - "README.md"
+      - "README.id.md"
+      - "CITATION.cff"
       - ".github/workflows/validate.yml"
   workflow_dispatch:
 
@@ -33,3 +41,17 @@ jobs:
         run: python -m pip install --upgrade pip && pip install "shapely>=2.1.0"
       - name: Syntax check and validate boundaries
         run: python -m py_compile scripts/ingest.py scripts/validate.py && python scripts/validate.py
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pipeline and test dependencies
+        run: python -m pip install --upgrade pip && pip install "geopandas>=1.0.0" "shapely>=2.1.0" "pyogrio>=0.10.0" pytest
+      - name: Run unit tests
+        run: pytest -v tests/

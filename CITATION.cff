@@ -1,0 +1,37 @@
+cff-version: 1.2.0
+message: "Scripts in scripts/ are MIT-licensed; boundary data remains © Badan Informasi Geospasial (BIG) (non-commercial, attribution required). Please cite both this repository and the official BIG source dataset."
+type: dataset
+title: "Indonesia Administrative Boundaries (BIG June 2026)"
+abstract: "Clean, reproducible GeoJSON and GeoPackage administrative boundaries of Indonesia covering 38 provinces and 514 kabupaten/kota districts across 3 topological tiers (official unsimplified 0°, high-detail 2e-05°, and simplified 0.001°), derived from Badan Informasi Geospasial (BIG) June 2026 data."
+authors:
+  - family-names: Ichsan
+    given-names: Dimas Maulana
+    website: "https://dmxsan.dev"
+repository-code: "https://github.com/dmxsan/indonesia-admin-boundaries"
+url: "https://dmxsan.dev/projects/indonesia-admin-boundaries"
+version: "v2026.06"
+date-released: 2026-11-25
+license-url: "https://github.com/dmxsan/indonesia-admin-boundaries/blob/main/LICENSE"
+keywords:
+  - indonesia
+  - administrative-boundaries
+  - geojson
+  - geopackage
+  - 38-provinces
+  - 514-districts
+  - 3-topological-tiers
+  - topological-coverage
+  - badan-informasi-geospasial
+  - big-june-2026
+references:
+  - type: data
+    title: "BATAS_KABKOTA_AR_2026 (Edisi Tahun 2026 Semester 1)"
+    authors:
+      - name: "Badan Informasi Geospasial (BIG)"
+    date-released: 2026-06-12
+    url: "https://tanahair.indonesia.go.id/"
+    identifiers:
+      - type: other
+        value: "TASWIL5000020260612KABKOTA"
+        description: "BIG Ina-Geoportal ISO metadata identifier"
+    notes: "Metadata ID: TASWIL5000020260612KABKOTA. Data batas yang berstatus indikatif tidak dapat dijadikan referensi hukum."

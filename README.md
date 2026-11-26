@@ -36,10 +36,12 @@ processed-data/
     │   └── with-districts/                # 38 files (districts per province)
     └── 03-districts/                      # 514 files (1 per kabupaten/kota)
 metadata/source.json                       # Source provenance & topology checks
+metadata/catalog.json                      # Machine-readable index of 38 provinces & 514 districts
 notebooks/explore_boundaries.ipynb         # Interactive 3-tier comparison map
 scripts/
 ├── ingest.py                              # Download, clean & build all tiers
 └── validate.py                            # Geometry, topology & metadata checks
+CITATION.cff                               # Citation metadata (repo & BIG source)
 ```
 
 ---
@@ -78,7 +80,32 @@ const soloRes = await fetch(`${BASE}/high-detail/03-districts/Kota_Surakarta.geo
 const soloGeoJSON = await soloRes.json();
 ```
 
-To inspect and compare tiers interactively in Jupyter, open [notebooks/explore_boundaries.ipynb](notebooks/explore_boundaries.ipynb).
+To inspect and compare tiers interactively in Jupyter, open [notebooks/explore_boundaries.ipynb](notebooks/explore_boundaries.ipynb). For programmatic lookup by official Kemendagri/BPS code, bounding box, or file path across all `38` provinces and `514` districts, fetch [`metadata/catalog.json`](metadata/catalog.json).
+
+### GIS & Cloud Workflows (QGIS, GEE & DuckDB)
+
+- **QGIS Desktop (No Download):** Load any `raw.githubusercontent.com/.../v2026.06/processed-data/.../*.geojson` URL via *Layer → Data Source Manager → Vector → Protocol: HTTP(S), cloud, etc.*. To stream a single Official (`0°`) region directly from GitHub Release `v2026.06` without downloading the full archive, choose *Source Type: File* (so QGIS doesn't prepend a second `/vsicurl/`) and paste:
+  ```text
+  /vsizip//vsicurl/https://github.com/dmxsan/indonesia-admin-boundaries/releases/download/v2026.06/official_03-districts_split-by-district.zip/03-districts/Kota_Surakarta.geojson
+  ```
+- **Google Earth Engine (Python API):** Load a district or province High-Detail GeoJSON (`≲ 8 MB` on disk to stay safely under GEE's `10 MiB` serialized HTTP payload limit) straight into `ee.FeatureCollection(requests.get(url).json())` without uploading a Table asset:
+  ```python
+  import ee, requests
+
+  ee.Initialize(project="your-gcp-project")
+  url = "https://raw.githubusercontent.com/dmxsan/indonesia-admin-boundaries/v2026.06/processed-data/high-detail/02-provinces/with-districts/Jawa_Tengah.geojson"
+  roi = ee.FeatureCollection(requests.get(url).json())
+  ```
+- **DuckDB Spatial:** Query boundary GeoJSONs directly over HTTPS:
+  ```sql
+  INSTALL httpfs;
+  LOAD httpfs;
+  INSTALL spatial;
+  LOAD spatial;
+
+  SELECT WADMPR, WADMKK
+  FROM ST_Read('https://raw.githubusercontent.com/dmxsan/indonesia-admin-boundaries/v2026.06/processed-data/high-detail/02-provinces/with-districts/Jawa_Tengah.geojson');
+  ```
 
 ---
 
@@ -182,6 +209,7 @@ python scripts/validate.py
 - **Provider:** Badan Informasi Geospasial (BIG) — [Ina-Geoportal](https://tanahair.indonesia.go.id/) & [Geoportal BIG](https://geoportal.big.go.id/)
 - **Source Dataset:** `BATAS_KABKOTA_AR_2026` (*Edisi Tahun 2026 Semester 1*, revised `2026-06-12`, metadata ID `TASWIL5000020260612KABKOTA`)
 - **Dual License:** See [`LICENSE`](LICENSE) — scripts in `scripts/` are **MIT-licensed**; geospatial data remains **© Badan Informasi Geospasial (BIG)** and is provided for non-commercial, educational, research, and software development use with mandatory attribution to BIG.
+- **Citation:** Structured citation metadata for both this repository and BIG's source dataset is available in [`CITATION.cff`](CITATION.cff).
 
 > *"Data batas yang berstatus indikatif tidak dapat dijadikan referensi hukum."*  
 > (Indicative boundary data cannot be used as a legal reference.)
