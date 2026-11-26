@@ -1,5 +1,7 @@
 # Indonesia Administrative Boundaries
 
+<p align="center"><strong>English 🇬🇧</strong> | <a href="README.id.md">Bahasa Indonesia 🇮🇩</a></p>
+
 Clean, reproducible GeoJSON and GeoPackage boundaries of Indonesia from national down to kabupaten/kota level, derived from official **Badan Informasi Geospasial (BIG)** data (**June 2026 / *Edisi Tahun 2026 Semester 1*** — `38` provinces, `514` districts).
 
 ---
