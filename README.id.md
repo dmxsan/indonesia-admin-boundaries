@@ -36,10 +36,12 @@ processed-data/
     │   └── with-districts/                # 38 file (daftar kabupaten/kota di tiap provinsi)
     └── 03-districts/                      # 514 file (1 file per kabupaten/kota)
 metadata/source.json                       # Informasi sumber data & hasil validasi topologi
+metadata/catalog.json                      # Indeks JSON seluruh 38 provinsi & 514 kabupaten/kota
 notebooks/explore_boundaries.ipynb         # Notebook interaktif untuk membandingkan ke-3 tingkat detail
 scripts/
 ├── ingest.py                              # Script untuk mengunduh, membersihkan & memproses seluruh data
 └── validate.py                            # Script pengujian geometri, topologi & kelengkapan atribut
+CITATION.cff                               # Metadata sitasi repositori & sumber resmi BIG
 ```
 
 ---
@@ -78,7 +80,32 @@ const soloRes = await fetch(`${BASE}/high-detail/03-districts/Kota_Surakarta.geo
 const soloGeoJSON = await soloRes.json();
 ```
 
-Jika ingin melihat dan membandingkan perbedaan tingkat kedetailan garis batas secara interaktif di Jupyter, silakan buka [notebooks/explore_boundaries.ipynb](notebooks/explore_boundaries.ipynb).
+Jika ingin melihat dan membandingkan perbedaan tingkat kedetailan garis batas secara interaktif di Jupyter, silakan buka [notebooks/explore_boundaries.ipynb](notebooks/explore_boundaries.ipynb). Untuk mencari kode Kemendagri/BPS, *bounding box*, maupun lokasi file ke-`38` provinsi dan `514` kabupaten/kota secara terprogram, silakan gunakan indeks JSON di [`metadata/catalog.json`](metadata/catalog.json).
+
+### Alur Kerja GIS & Cloud (QGIS, GEE & DuckDB)
+
+- **QGIS Desktop (Tanpa Unduh Manual):** Muat file GeoJSON dari `raw.githubusercontent.com/.../v2026.06/processed-data/.../*.geojson` langsung melalui menu *Layer → Data Source Manager → Vector → Protocol: HTTP(S), cloud, etc.*. Untuk membuka satu wilayah versi resmi tanpa simplifikasi (`0°`) dari aset GitHub Release `v2026.06` tanpa harus mengunduh seluruh arsip `.zip`, pilih *Source Type: File* (agar QGIS tidak menyisipkan awalan `/vsicurl/` ganda) lalu gunakan path berikut:
+  ```text
+  /vsizip//vsicurl/https://github.com/dmxsan/indonesia-admin-boundaries/releases/download/v2026.06/official_03-districts_split-by-district.zip/03-districts/Kota_Surakarta.geojson
+  ```
+- **Google Earth Engine (Python API):** Untuk file GeoJSON *High-Detail* tingkat kabupaten/kota maupun provinsi berukuran `≲ 8 MB` (agar tetap aman di bawah batas payload `10 MiB` GEE setelah serialisasi), muat langsung ke `ee.FeatureCollection(requests.get(url).json())` di memori tanpa perlu mengunggah *Table asset* terlebih dahulu:
+  ```python
+  import ee, requests
+
+  ee.Initialize(project="your-gcp-project")
+  url = "https://raw.githubusercontent.com/dmxsan/indonesia-admin-boundaries/v2026.06/processed-data/high-detail/02-provinces/with-districts/Jawa_Tengah.geojson"
+  roi = ee.FeatureCollection(requests.get(url).json())
+  ```
+- **DuckDB Spatial:** Jalankan query spasial langsung melalui HTTPS tanpa mengunduh file ke disk:
+  ```sql
+  INSTALL httpfs;
+  LOAD httpfs;
+  INSTALL spatial;
+  LOAD spatial;
+
+  SELECT WADMPR, WADMKK
+  FROM ST_Read('https://raw.githubusercontent.com/dmxsan/indonesia-admin-boundaries/v2026.06/processed-data/high-detail/02-provinces/with-districts/Jawa_Tengah.geojson');
+  ```
 
 ---
 
@@ -182,5 +209,6 @@ python scripts/validate.py
 - **Sumber Resmi:** Badan Informasi Geospasial (BIG) — [Ina-Geoportal](https://tanahair.indonesia.go.id/) & [Geoportal BIG](https://geoportal.big.go.id/)
 - **Dataset Acuan:** `BATAS_KABKOTA_AR_2026` (*Edisi Tahun 2026 Semester 1*, pembaruan `2026-06-12`, ID metadata `TASWIL5000020260612KABKOTA`)
 - **Ketentuan Lisensi (*Dual License*):** Detail lengkap tersedia pada file [`LICENSE`](LICENSE) — seluruh kode pemrosesan di dalam folder `scripts/` berada di bawah lisensi **MIT**, sedangkan data geospasial batas wilayah tetap merupakan hak cipta **© Badan Informasi Geospasial (BIG)** untuk keperluan non-komersial, pendidikan, riset, dan pengembangan aplikasi dengan tetap mencantumkan BIG sebagai sumber data.
+- **Sitasi:** Metadata sitasi terstruktur untuk repositori ini beserta dataset acuan BIG tersedia pada [`CITATION.cff`](CITATION.cff).
 
 > *"Data batas yang berstatus indikatif tidak dapat dijadikan referensi hukum."*
